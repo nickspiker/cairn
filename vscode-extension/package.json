@@ -1,0 +1,88 @@
+{
+  "name": "cairn",
+  "displayName": "Cairn",
+  "description": "Patch-based version control for successful cargo builds",
+  "version": "0.0.0",
+  "publisher": "nickspiker",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cairn.init",
+        "title": "Cairn: Initialize Repository"
+      },
+      {
+        "command": "cairn.list",
+        "title": "Cairn: List Patches"
+      },
+      {
+        "command": "cairn.rollback",
+        "title": "Cairn: Rollback to Patch"
+      },
+      {
+        "command": "cairn.showPatch",
+        "title": "Cairn: Show Patch Details"
+      },
+      {
+        "command": "cairn.refresh",
+        "title": "Cairn: Refresh History"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cairn",
+          "title": "Cairn",
+          "icon": "resources/cairn-icon.png"
+        }
+      ]
+    },
+    "views": {
+      "cairn": [
+        {
+          "id": "cairnHistory",
+          "name": "Patch History"
+        }
+      ]
+    },
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "cairn.showPatch",
+          "when": "view == cairnHistory && viewItem == patch",
+          "group": "inline"
+        },
+        {
+          "command": "cairn.rollback",
+          "when": "view == cairnHistory && viewItem == patch"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.x",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.x",
+    "@typescript-eslint/parser": "^6.x",
+    "eslint": "^8.x",
+    "typescript": "^5.3.0"
+  }
+}
