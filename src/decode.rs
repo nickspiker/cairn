@@ -1,4 +1,3 @@
-//! VSF decoding for cairn patches
 //!
 //! Parses VSF-encoded patches back into Rust structures.
 
@@ -28,6 +27,7 @@ impl Patch {
                 operations = Vec::new();
                 continue;
             }
+
 
             // Jump to section offset
             ptr = field.offset_bytes;
@@ -306,12 +306,12 @@ fn extract_eagle_time(value: &VsfType) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patch::nick_spiker_author_id;
+    use crate::patch::get_author_id;
     use std::path::PathBuf;
 
     #[test]
     fn test_roundtrip_patch() {
-        let author = nick_spiker_author_id();
+        let author = get_author_id();
         let build_hash = blake3::hash(b"test build output");
 
         let original = Patch::new(
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_decode_with_parent() {
-        let author = nick_spiker_author_id();
+        let author = get_author_id();
         let parent = *blake3::hash(b"parent patch").as_bytes();
         let build_hash = blake3::hash(b"build");
 
@@ -385,3 +385,4 @@ mod tests {
         assert_eq!(decoded.metadata.parent, Some(parent));
     }
 }
+//! VSF decoding for cairn patches

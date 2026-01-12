@@ -1,141 +1,80 @@
-
 # Cairn
 
-**Patch-based version control for successful cargo builds.**
-
-## The Problem
-
-You spend 3 hours coding. You run `cargo build`. 500 errors. You don't remember what you changed.
-
-Git shows you a diff with 800 lines across 12 files. You spend 2 hours trying to undo your changes. You give up and `git reset --hard` to your last commit from yesterday, losing everything.
-
-**Cairn solves this:** Every successful build is automatically captured as a patch. One command rolls back to any previous working state.
+**Build-gated version control for Rust projects.**
 
 ---
 
-### Different Approach: Build-Gated Versioning
+## The Problem
 
-Git is a general-purpose version control system that works for any file type. This flexibility means it doesn't know whether your code compiles.
+You code for 3 hours. Run `cargo build`. 500 errors. Don't remember what changed.
 
-Cairn takes a different approach for Rust projects: it only saves states that successfully build.
+Git shows 800 lines across 12 files. You spend 2 hours trying to undo changes. Finally `git reset --hard`, losing everything.
 
-**With manual versioning:**
-```bash
-$ git log --oneline
-a3f8d9e (HEAD) WIP: refactoring parser
-d7e2c1f Fix tests
-c4b9a2e Update dependencies
-9f1d3e7 Initial commit
-```
+**Cairn solves this:** Every successful build auto-captures as a patch. Instant rollback to any working state.
 
-When you roll back, you don't know which states actually compiled.
+---
 
-**With build-gated versioning:**
-```bash
-$ cairn list
-● a3f8d9e1 - just now - "Successful build"
-● d7e2c1f - 1 hr ago - "Successful build"
-● 9f1d3e7 - yesterday - "Successful build"
-```
+## Core Concept: Build-Gated Versioning
 
-Every state in history is guaranteed to build. No guessing.
-
-### Cairn's Solution: Build-Gated Patches
-
-**Every patch in cairn history is guaranteed to build successfully.**
+**Git doesn't know if your code compiles. Cairn only saves states that build.**
 
 ```bash
-$ # Make changes that break the build
+$ # Make breaking changes
 $ cargo build
-error[E0425]: cannot find function `parse_token` in this scope
+error[E0425]: cannot find function `parse_token`
   → Nothing happens. No patch created.
 
 $ # Fix the build
 $ cargo build
     Finished dev [unoptimized + debuginfo] target(s) in 2.34s
-✓ Cairn: Patch created (a3f8d9e1)
+✓ Patch created: maple-crane-forest-pixel-dance
 
 $ cairn list
-● a3f8d9e1 - just now - "Successful build"  ← GUARANTEED TO WORK
-● d7e2c1f - 1 hr ago - "Successful build"   ← GUARANTEED TO WORK
-● 9f1d3e7 - yesterday - "Successful build"  ← GUARANTEED TO WORK
+● maple-crane-forest-pixel-dance [CURRENT]
+  "Modified 3 files (+47, -23) in decode.rs, apply.rs"
+  2 minutes ago
+
+● cloud-river-stone-bright-moon
+  "Refactored error handling in parser.rs"
+  1 hour ago
 ```
 
-**When you rollback, you KNOW it will build:**
-
-```bash
-$ cairn rollback d7e2c1f
-✓ Restored to patch d7e2c1f
-
-$ cargo build
-    Finished dev [unoptimized + debuginfo] target(s) in 0.23s  ← Always works
-```
-
-**No manual intervention required:**
-- Build succeeds → Cairn saves it automatically
-- Build fails → Nothing happens
-- **You cannot pollute history with broken code**
-
-This is why Cairn has **no manual patch command** - the compiler is the gatekeeper.
+**Every patch in history is guaranteed to build.** No broken states, no guessing.
 
 ---
 
-## What Cairn Does
+## Features
 
-**Automatic patches:**
-- `cargo build` succeeds → Cairn creates a patch automatically
-- `cargo build` fails → Nothing happens
-- **Every patch in history is a working build**
+**Automatic patches on successful builds:**
+- Build succeeds → patch created automatically
+- Build fails → nothing happens
+- No manual commands (compiler is the gatekeeper)
 
 **Instant rollback:**
 ```bash
-$ cairn rollback a3f8d9e1
-Restored to patch a3f8d9e1 (37 minutes ago)
-✓ Rolled back 10,000 files (1 changed) in 16ms
+$ cairn rollback cloud-river-stone-bright-moon
+✓ Rolled back 10,000 files (47 changed) in 16ms
 
 $ cargo build
-    Finished dev [unoptimized + debuginfo] target(s) in 0.23s
+    Finished dev in 0.23s  ← Guaranteed to work
 ```
 
-**Patch-based storage:**
-- Stores *what changed*, not entire file copies
-- 420 bytes for a typical patch vs 700+ bytes for JSON
-- Cryptographically verified (BLAKE3)
-- Stored in VSF format (efficient, self-describing)
+**Mnemonic patch IDs and LLM summary:**
+- Local LLM summarizes edits into 1 sentence
+- Basic stats also show upon hover, patch size, patch file location
+- 5-word phrases instead of git hashes
+- Easy to remember: "maple-crane-forest-pixel-dance"
+- Fuzzy matching: "maple crane" finds the patch
 
----
+**Slide through time:**
+- Click any patch → instant rollback (no confirmation)
+- Keep clicking to explore history
+- Build with changes → creates new patch, orphans future ones
 
-## How It Works
-
-### Build-Gated Patches
-
-Cairn watches for successful `cargo build` and captures:
-1. What cargo actually compiled (from fingerprint, not current disk state)
-2. Computes delta from last successful build
-3. Creates VSF-encoded patch with Reed-Solomon error correction
-4. Stores patch in `.cairn/patches/`
-
-**Race condition solved:** If you edit files while build is running, Cairn captures what cargo *actually compiled*, not what's on disk when the build finishes.
-
-### Patch Theory
-
-Based on the mathematical theory of patches from Pijul/Darcs:
-
-- **Patches are content-addressed** (BLAKE3 hash of operations)
-- **Patches are composable** (can be applied in sequence)
-- **Patches have inverses** (rollback = apply inverse patch)
-- **Linear history** (Week 1: no merges, that comes later with commutation)
-
-### Atomic Operations
-
-Every state change is atomic:
-
-1. Build complete patch in temp directory
-2. Use hardlinks for unchanged files (zero copy)
-3. Atomic directory swap (`rename` is atomic on all filesystems)
-4. Update state file (single atomic write with Reed-Solomon)
-
-**If crash happens:** Repository stays consistent. Recovery on next startup.
+**VSF-encoded patches:**
+- ~420 bytes typical patch (vs 700+ for JSON)
+- BLAKE3 cryptographic verification
+- Reed-Solomon error correction (2x size, 10000x reliability)
 
 ---
 
@@ -145,8 +84,7 @@ Every state change is atomic:
 cargo install cairn
 ```
 
-Or build from source:
-
+Or from source:
 ```bash
 git clone https://github.com/nickspiker/cairn
 cd cairn
@@ -158,176 +96,205 @@ cargo install --path .
 
 ## Usage
 
-### Initialize repository
-
+**Initialize:**
 ```bash
 $ cd your-rust-project
 $ cairn init
-Initialized .cairn/ directory
-No patches yet - run 'cargo build' to create first patch
+Initialized .cairn/
+No patches yet - run 'cargo build' to create first
 ```
 
-### Build your project (automatic patch creation)
-
+**Build (automatic patch):**
 ```bash
 $ cargo build
-   Compiling myproject v0.0.0
-    Finished dev [unoptimized + debuginfo] target(s) in 2.34s
-✓ Cairn: Patch created (a3f8d9e1)
+    Finished dev in 2.34s
+✓ Patch created: maple-crane-forest-pixel-dance
   10 files tracked
 ```
 
-Cairn automatically creates a patch after **every successful build**. No manual command needed.
-
-### List patch history
-
+**List history:**
 ```bash
 $ cairn list
-● d8e9f1a2 - 2 min ago - "Fixed parser edge case"
-  src/parser.rs (+12, -3)
+● maple-crane-forest [CURRENT] - 2 min ago
+  "Modified decode.rs, apply.rs (+47, -23)"
+  
+● cloud-river-stone - 1 hr ago
+  "Refactored error handling"
 
-● b7c2a4f3 - 1 hr ago - "Refactored error handling"
-  src/error.rs (+45, -12)
-  src/lib.rs (+8, -2)
-
-● a3f8d9e1 - yesterday - "Initial patch"
-  src/main.rs, src/lib.rs, Cargo.toml
+○ swift-ocean-light - yesterday
+  "Initial commit"
 ```
 
-### Rollback to previous build
-
+**Rollback:**
 ```bash
-$ cairn rollback b7c2a4f3
-Restoring to patch b7c2a4f3 (1 hour ago)...
-✓ Restored 10,000 files (47 changed)
-Rollback complete in 23ms
+$ cairn rollback cloud-river
+✓ Restored to cloud-river-stone-bright-moon (1 hour ago)
+  47 files changed in 23ms
 
 $ cargo build
-    Finished dev [unoptimized + debuginfo] target(s) in 0.31s
+    Finished dev in 0.31s
 ```
 
-### Show patch details
-
+**Fuzzy matching works:**
 ```bash
-$ cairn show d8e9f1a2
-Patch: d8e9f1a2
-Author: Nick Spiker <nick@spiker.dev>
-Date: 2026-01-11 14:30:22
-Message: Fixed parser edge case
-
-Changes:
-  src/parser.rs
-    + Line 42: if token.is_empty() { return Err(...); }
-    - Line 38: let result = parse_token(token);
+$ cairn rollback maple    # Finds maple-crane-forest-pixel-dance
+$ cairn rollback cloud r  # Finds cloud-river-stone-bright-moon
 ```
 
 ---
 
 ## VSCode Extension
 
-Automatic patch creation on successful build with visual timeline:
+Install from marketplace: `cairn`
+
+**Features:**
+- Auto-patch on successful build
+- Visual timeline with mnemonics
+- Hover for AI-generated summaries
+- Click patch → instant rollback
+- Orphaned patches section
 
 ```
-CAIRN HISTORY
-├─ ● d8e9f1a2 (2 min ago)
-│    "Fixed parser edge case"
-│    [View Delta] [Rollback]
-│
-├─ ● b7c2a4f3 (1 hr ago)
-│    "Refactored error handling"
-│    [View Delta] [Rollback]
+HISTORY
+● maple-crane-forest-pixel-dance [CURRENT]
+  ↑ Hover: "Refactored error handling in decode.rs..."
+  ↑ Click: instant rollback
+
+● cloud-river-stone-bright-moon
+● swift-ocean-light-paper-wind
+
+ORPHANED (parent: cloud-river-stone)
+○ broken-attempt-one
+○ broken-attempt-two
+  (These were orphaned when you rolled back and built)
 ```
 
-Status bar shows last successful build. One-click rollback.
+---
+
+## How It Works
+
+**Build-gated capture:**
+1. `cargo build` succeeds
+2. Check if files changed (prevent duplicate patches)
+3. Compute delta from current state
+4. Create VSF-encoded patch
+5. Store in `.cairn/patches/`
+
+**Race condition solved:** Uses cargo's fingerprint to capture exactly what was compiled, not current disk state.
+
+**Atomic rollback:**
+1. Build file tree in temp directory
+2. Hardlink unchanged files (zero copy)
+3. Atomic directory swap (`rename` is atomic)
+4. Update state file (Reed-Solomon protected)
+
+If crash happens: repo stays consistent, recovery on next startup.
+
+**Orphaning:** After rollback + build with changes, future patches move to ORPHANED section. Nothing is lost—you can restore orphaned patches.
 
 ---
 
 ## Technical Details
 
-### VSF Encoding
-
-Patches stored in [Versatile Storage Format](https://github.com/nickspiker/vsf):
-
-```
-420 Bytes total
-├─ metadata: 105 bytes (author, parent, message)
-├─ operations: 63 bytes (line-based deltas with file paths)
-└─ build_output: 69 bytes (cargo hash for verification)
-
-✓ BLAKE3 provenance hash (integrity)
-✓ Reed-Solomon error correction (2x bloat, 10000x reliability)
-✓ Huffman compression on strings (36% smaller)
-```
-
-### Repository Structure
-
+**Repository structure:**
 ```
 .cairn/
-├── state.vsf              # Current repository state (with Reed-Solomon)
-├── patches/               # VSF-encoded patches
-│   ├── a3f8d9e1...vsf
-│   ├── b7c2a4f3...vsf
-│   └── d8e9f1a2...vsf
-└── objects/               # Content-addressed file storage
-    ├── a3/f8d9e1...       # File content (by BLAKE3 hash)
-    └── b7/c2a4f3...
+├── state.vsf              # Current state + history
+├── patches/               # VSF-encoded patches (by provenance hash)
+│   └── xiN2nO...lKI.vsf
+└── objects/               # Content-addressed storage
+    └── a3/f8d9e1...
 ```
 
-### Patch Format
-
+**Patch format:**
 ```rust
 struct Patch {
-    metadata: PatchMetadata {
-        author: [u8; 32],           // BLAKE3 of "Nick Spiker <email>"
-        parent: Option<[u8; 32]>,   // Linear history (no merges yet)
-        timestamp: f64,              // Eagle Time (not Unix time)
-        message: String,
+    metadata: {
+        author: [u8; 32],       // BLAKE3("Nick Spiker <email>")
+        parent: Option<PatchId>,
+        timestamp: f64,
+        ai_summary: String,     // Auto-generated
     },
-    operations: Vec<LineOp> {
-        InsertLine { file: PathBuf, after: usize, content: Vec<u8> },
-        DeleteLine { file: PathBuf, at: usize, old_content: Vec<u8> },
-        ModifyLine { file: PathBuf, at: usize, old: Vec<u8>, new: Vec<u8> },
-        AddFile { path: PathBuf, content: Vec<u8> },
-        DeleteFile { path: PathBuf, old_content: Vec<u8> },
-        RenameFile { from: PathBuf, to: PathBuf },
+    delta: Vec<Change> {
+        InsertLine { file, after, content },
+        DeleteLine { file, at, old_content },
+        ModifyLine { file, at, old, new },
+        AddFile { path, content },
+        DeleteFile { path, old_content },
+        RenameFile { from, to },
     },
-    build_hash: [u8; 32],           // BLAKE3 of cargo output
+    build_hash: [u8; 32],
 }
 ```
+
+**AI summaries:** Generated using embedded `lm.rs` model (~50MB, zero dependencies). Example: "Refactored error handling in decode.rs, added empty section support"
+
+**Terminology:**
+- **State**: Repository snapshot (`.cairn/state.vsf`)
+- **Patch**: VSF file containing delta + metadata
+- **Delta**: Set of changes in a patch
+- **Change**: Single operation (InsertLine, AddFile, etc.)
+- **History**: Chronological chain of patches
+- **Current**: Active patch (working directory state)
+- **Orphaned**: Patches cut off after rollback + new build
+
+---
+
+## Works With Git
+
+Cairn complements Git—use both:
+- **Git** for commits, branches, collaboration
+- **Cairn** for build-gated local snapshots
+
+Cairn doesn't replace Git's collaboration features. It solves a different problem: "give me the last state that compiled."
 
 ---
 
 ## Prior Art
 
-Cairn builds on:
-
-- **Pijul** - Patch theory with commutation properties
-- **Darcs** - Original theory of patches (2002)
-- **Git** - Content-addressed storage and widespread adoption
+Built on:
+- **Pijul/Darcs** - Patch theory with commutation
+- **Git** - Content-addressed storage
 - **BTRFS** - Copy-on-write snapshots
 
-**What's novel:**
-- Build-gated patches (not time-based or manual)
-- Cargo fingerprint as source-of-truth (solves race conditions)
-- VSF encoding (smaller, faster, cryptographically verified)
-- Hardlink optimization (instant rollback for large projects)
+Novel contributions:
+- Build-gated snapshots (not time/manual)
+- Cargo fingerprint for race-free capture
+- Mnemonic patch IDs (5-word phrases)
+- VSF encoding (efficient, verified)
+- Hardlink optimization (instant rollback)
+- Embedded AI summaries (zero dependencies)
 
 ---
 
-## Limitations
+## Current Limitations
 
-**Linear history only:**
-- No merges yet (coming with commutation)
-- Multi-developer: last push wins, rebase required
-- Use `cairn pull` before `cairn push`
+**Linear history:**
+- No merges yet (coming with patch commutation)
+- Multi-dev: rebase required
+- Orphaned patches handle divergence
 
-**Rust-specific:**
-- Assumes `cargo build` as build command
-- Can be adapted for other languages later
+**Rust-only:**
+- Assumes `cargo build`
+- Multi-language support planned
 
-**Local only:**
-- No cloud sync yet
-- Copy `.cairn/` directory to sync across machines
+**Local-only:**
+- No remote sync yet
+- Copy `.cairn/` to sync manually
+
+---
+
+## Roadmap
+
+**v0.1.0** (Week 2):
+- Patch commutation (merge support)
+- Multi-developer workflows
+- Conflict detection
+
+**v0.2.0** (Week 3):
+- Cloud sync (encrypted)
+- TOKEN-signed patches
+- Multi-language support
 
 ---
 
@@ -341,9 +308,9 @@ MIT or Apache-2.0, your choice.
 
 **Nick Spiker**
 
-Building tools from first principles:
+Building correct tools from first principles:
 - [Spirix](https://github.com/nickspiker/spirix) - Two's complement floating point
-- [Photon](https://github.com/nickspiker/photon) - Unfuckwithable comms
+- [TOKEN](https://github.com/nickspiker/token) - Cryptographic identity
 - [VSF](https://github.com/nickspiker/vsf) - Versatile Storage Format
 - [ferros](https://ferros.org) - Kill-switch ready OS
 
@@ -351,15 +318,15 @@ Building tools from first principles:
 
 ## Contributing
 
-Cairn is in active development. Pull requests welcome.
+Pull requests welcome.
 
-**Before contributing:**
-- Read `AGENT.md` for coding guidelines
-- Run `cargo test` (all tests must pass)
-- No bounds checks without proof of necessity
-- Use VSF's high-level APIs (never manual byte manipulation)
+Before contributing:
+- Read `AGENT.md` for guidelines
+- All tests must pass (`cargo test`)
+- No bounds checks without proof
+- Use VSF high-level APIs only
 
-**Questions?** Open an issue.
+Questions? Open an issue.
 
 ---
 

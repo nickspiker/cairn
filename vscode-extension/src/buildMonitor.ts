@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { CairnProvider } from './cairnProvider';
 import { BinaryManager } from './binaryManager';
-import { execSync } from 'child_process';
+import { runCairn } from './cairnUtils';
 import * as path from 'path';
 
 export class BuildTaskMonitor {
@@ -55,11 +55,7 @@ export class BuildTaskMonitor {
 
             // Create snapshot after successful build
             try {
-                const cairnPath = await this.binaryManager.getCairnPath();
-                execSync(`"${cairnPath}" snapshot -m "Successful build"`, {
-                    cwd: workspaceFolder.uri.fsPath,
-                    encoding: 'utf8'
-                });
+                await runCairn(this.binaryManager, ['snapshot', '-m', 'Successful build']);
 
                 console.log('Created cairn patch after successful build');
 
@@ -68,7 +64,7 @@ export class BuildTaskMonitor {
                 this.updateStatusBar();
 
                 // Show notification
-                vscode.window.showInformationMessage('Cairn: Patch created after successful build');
+                vscode.window.showInformationMessage('✓ Cairn patch created');
             } catch (error) {
                 console.error('Failed to create cairn patch:', error);
             }

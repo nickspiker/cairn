@@ -7,7 +7,7 @@
 //! 4. Updating repository state
 
 use crate::diff;
-use crate::patch::{Patch, nick_spiker_author_id};
+use crate::patch::{Patch, get_author_id};
 use crate::state::RepositoryState;
 use anyhow::{Context, Result};
 use blake3::Hash;
@@ -16,22 +16,20 @@ use std::fs;
 use std::path::PathBuf;
 use vsf::verification::compute_provenance_hash;
 
-/// Create a patch from the current working directory
+/// Create a patch from pre-captured file state
 ///
-/// This is the main entry point called after a successful build.
-/// Returns the patch ID of the newly created patch.
-pub fn create_snapshot(
+/// This is used by cargo-cairn to create a patch from files that were
+/// captured BEFORE the build started, ensuring the patch matches exactly
+/// what was compiled.
+pub fn create_snapshot_from_files(
     cairn_dir: &PathBuf,
     message: String,
     build_hash: Hash,
+    current_files: HashMap<PathBuf, Vec<u8>>,
 ) -> Result<String> {
     // Load current repository state
     let mut repo_state = RepositoryState::load(cairn_dir)
         .context("Failed to load repository state")?;
-
-    // Scan working directory for files
-    let current_files = scan_working_directory()
-        .context("Failed to scan working directory")?;
 
     // Get previous state from repository
     let previous_files = get_previous_files(&repo_state, cairn_dir)?;
@@ -61,7 +59,7 @@ pub fn create_snapshot(
     };
 
     let patch = Patch::new(
-        nick_spiker_author_id(),
+        get_author_id(),
         parent,
         timestamp,
         message,
@@ -97,8 +95,25 @@ pub fn create_snapshot(
     Ok(patch_id)
 }
 
+/// Create a patch from the current working directory
+///
+/// This is the main entry point called after a successful build.
+/// Returns the patch ID of the newly created patch.
+pub fn create_snapshot(
+    cairn_dir: &PathBuf,
+    message: String,
+    build_hash: Hash,
+) -> Result<String> {
+    // Scan working directory for files
+    let current_files = scan_working_directory()
+        .context("Failed to scan working directory")?;
+
+    // Create snapshot from those files
+    create_snapshot_from_files(cairn_dir, message, build_hash, current_files)
+}
+
 /// Scan working directory for all files (excluding .cairn, target, .git)
-fn scan_working_directory() -> Result<HashMap<PathBuf, Vec<u8>>> {
+pub fn scan_working_directory() -> Result<HashMap<PathBuf, Vec<u8>>> {
     let mut files = HashMap::new();
 
     // Get current directory
@@ -125,16 +140,28 @@ fn scan_directory(
         // Skip excluded directories
         if path.is_dir() {
             let name = file_name.to_string_lossy();
-            if name == ".cairn" || name == "target" || name == ".git" || name.starts_with('.') {
+            if name == ".cairn"
+                || name == "target"
+                || name == ".git"
+                || name == "node_modules"
+                || name == "out"
+                || name == "dist"
+                || name.starts_with('.')
+            {
                 continue;
             }
 
             // Recurse into subdirectory
             scan_directory(base_dir, &path.to_path_buf(), files)?;
         } else if path.is_file() {
-            // Skip hidden files
+            // Skip hidden files and build artifacts
             let name = file_name.to_string_lossy();
-            if name.starts_with('.') {
+            if name.starts_with('.')
+                || name.ends_with(".vsix")
+                || name.ends_with(".wasm")
+                || name == "package-lock.json"
+                || name == "Cargo.lock"
+            {
                 continue;
             }
 
@@ -155,7 +182,7 @@ fn scan_directory(
 }
 
 /// Get the file tree from the previous patch
-fn get_previous_files(
+pub fn get_previous_files(
     repo_state: &RepositoryState,
     cairn_dir: &PathBuf,
 ) -> Result<HashMap<PathBuf, Vec<u8>>> {

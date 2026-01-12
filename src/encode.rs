@@ -141,13 +141,13 @@ fn encode_build_section(build_hash: &blake3::Hash) -> Result<VsfSection> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patch::{nick_spiker_author_id, PatchMetadata};
+    use crate::patch::{get_author_id, PatchMetadata};
     use std::path::PathBuf;
 
     #[test]
     fn test_encode_metadata() {
         let metadata = PatchMetadata {
-            author: nick_spiker_author_id(),
+            author: get_author_id(),
             parent: None,
             timestamp: 1234567890.0,
             message: "Test patch".to_string(),
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_full_patch_encode() {
-        let author = nick_spiker_author_id();
+        let author = get_author_id();
         let build_hash = blake3::hash(b"test build");
 
         let patch = Patch::new(
@@ -227,7 +227,7 @@ mod tests {
     fn test_inspect_patch_vsf() {
         use vsf::inspect::inspect_vsf;
 
-        let author = nick_spiker_author_id();
+        let author = get_author_id();
         let build_hash = blake3::hash(b"test build");
 
         let patch = Patch::new(

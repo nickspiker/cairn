@@ -1,10 +1,15 @@
 import * as vscode from 'vscode';
 import { CairnProvider } from './cairnProvider';
-import { BuildTaskMonitor } from './buildMonitor';
+import { BuildCommandsProvider } from './buildCommandsProvider';
 import { BinaryManager } from './binaryManager';
+import { runCairn } from './cairnUtils';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
 
 let cairnProvider: CairnProvider;
-let buildMonitor: BuildTaskMonitor;
+let buildCommandsProvider: BuildCommandsProvider;
 let binaryManager: BinaryManager;
 
 export function activate(context: vscode.ExtensionContext) {
@@ -17,20 +22,34 @@ export function activate(context: vscode.ExtensionContext) {
     cairnProvider = new CairnProvider(context, binaryManager);
     vscode.window.registerTreeDataProvider('cairnHistory', cairnProvider);
 
-    // Initialize build task monitor
-    buildMonitor = new BuildTaskMonitor(context, cairnProvider, binaryManager);
+    // Initialize build commands provider
+    buildCommandsProvider = new BuildCommandsProvider();
+    vscode.window.registerTreeDataProvider('cairnBuildCommands', buildCommandsProvider);
 
     // Register commands
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.init', async () => {
-            await runCairnCommand(['init']);
-            cairnProvider.refresh();
+            try {
+                await runCairn(binaryManager, ['init']);
+                cairnProvider.refresh();
+                vscode.window.showInformationMessage('✓ Cairn initialized');
+            } catch (error) {
+                vscode.window.showErrorMessage(`Failed to initialize cairn: ${error}`);
+            }
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.list', async () => {
-            await runCairnCommand(['list']);
+            try {
+                const output = await runCairn(binaryManager, ['list']);
+                const outputChannel = vscode.window.createOutputChannel('Cairn');
+                outputChannel.clear();
+                outputChannel.appendLine(output);
+                outputChannel.show();
+            } catch (error) {
+                vscode.window.showErrorMessage(`Failed to list patches: ${error}`);
+            }
         })
     );
 
@@ -77,17 +96,45 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    context.subscriptions.push(
+        vscode.commands.registerCommand('cairn.runBuildCommand', async (buildCommandItem) => {
+            if (buildCommandItem && buildCommandItem.cargoCommand) {
+                await runBuildCommand(buildCommandItem.cargoCommand);
+            }
+        })
+    );
+
     // Initial refresh
     cairnProvider.refresh();
 }
 
 export function deactivate() {
-    if (buildMonitor) {
-        buildMonitor.dispose();
+    // Cleanup if needed
+}
+
+async function rollbackToPatch(patchId: string): Promise<void> {
+    try {
+        await runCairn(binaryManager, ['rollback', patchId]);
+        cairnProvider.refresh();
+        vscode.window.showInformationMessage(`✓ Rolled back to ${patchId}`);
+    } catch (error) {
+        vscode.window.showErrorMessage(`Failed to rollback: ${error}`);
     }
 }
 
-async function runCairnCommand(args: string[]): Promise<void> {
+async function showPatchDetails(patchId: string): Promise<void> {
+    try {
+        const output = await runCairn(binaryManager, ['show', patchId]);
+        const outputChannel = vscode.window.createOutputChannel('Cairn');
+        outputChannel.clear();
+        outputChannel.appendLine(output);
+        outputChannel.show();
+    } catch (error) {
+        vscode.window.showErrorMessage(`Failed to show patch: ${error}`);
+    }
+}
+
+async function runBuildCommand(cargoCommand: string): Promise<void> {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
     if (!workspaceFolder) {
         vscode.window.showErrorMessage('No workspace folder open');
@@ -95,34 +142,39 @@ async function runCairnCommand(args: string[]): Promise<void> {
     }
 
     try {
-        const cairnPath = await binaryManager.getCairnPath();
+        // Show output in dedicated output channel
+        const outputChannel = vscode.window.createOutputChannel('Cairn Build');
+        outputChannel.clear();
+        outputChannel.show();
 
-        const terminal = vscode.window.createTerminal({
-            name: 'Cairn',
+        outputChannel.appendLine(`Running: cargo cairn ${cargoCommand}\n`);
+
+        // Run cargo cairn command
+        const { stdout, stderr } = await execAsync(`cargo cairn ${cargoCommand}`, {
             cwd: workspaceFolder.uri.fsPath
         });
 
-        terminal.show();
-        terminal.sendText(`"${cairnPath}" ${args.join(' ')}`);
-    } catch (error) {
-        vscode.window.showErrorMessage(`Failed to get cairn binary: ${error}`);
-    }
-}
+        if (stdout) {
+            outputChannel.appendLine(stdout);
+        }
+        if (stderr) {
+            outputChannel.appendLine(stderr);
+        }
 
-async function rollbackToPatch(patchId: string): Promise<void> {
-    const confirmed = await vscode.window.showWarningMessage(
-        `Rollback to patch ${patchId}? This will overwrite your working directory.`,
-        { modal: true },
-        'Rollback'
-    );
-
-    if (confirmed) {
-        await runCairnCommand(['rollback', patchId]);
+        // Refresh the patch history after build
         cairnProvider.refresh();
-        vscode.window.showInformationMessage(`Rolled back to patch ${patchId}`);
-    }
-}
 
-async function showPatchDetails(patchId: string): Promise<void> {
-    await runCairnCommand(['show', patchId]);
+        vscode.window.showInformationMessage(`✓ cargo cairn ${cargoCommand} completed`);
+    } catch (error: any) {
+        const outputChannel = vscode.window.createOutputChannel('Cairn Build');
+        outputChannel.appendLine(`Error running cargo cairn ${cargoCommand}:`);
+        if (error.stdout) {
+            outputChannel.appendLine(error.stdout);
+        }
+        if (error.stderr) {
+            outputChannel.appendLine(error.stderr);
+        }
+        outputChannel.show();
+        vscode.window.showErrorMessage(`Failed to run cargo cairn ${cargoCommand}`);
+    }
 }

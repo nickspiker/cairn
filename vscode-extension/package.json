@@ -4,6 +4,7 @@
   "description": "Patch-based version control for successful cargo builds",
   "version": "0.0.0",
   "publisher": "nickspiker",
+  "icon": "resources/cairn-icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -11,11 +12,26 @@
     "SCM Providers",
     "Other"
   ],
-  "activationEvents": [
-    "onStartupFinished"
-  ],
+  "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "Cairn",
+      "properties": {
+        "cairn.buildCommands": {
+          "type": "array",
+          "default": [
+            {"label": "Build", "command": "build", "icon": "tools"},
+            {"label": "Build (Release)", "command": "build --release", "icon": "rocket"},
+            {"label": "Check", "command": "check", "icon": "check"},
+            {"label": "Test", "command": "test", "icon": "beaker"},
+            {"label": "Run", "command": "run", "icon": "run"},
+            {"label": "Clean", "command": "clean", "icon": "trash"}
+          ],
+          "description": "Cargo commands to show as buttons in the Cairn panel"
+        }
+      }
+    },
     "commands": [
       {
         "command": "cairn.init",
@@ -36,22 +52,21 @@
       {
         "command": "cairn.refresh",
         "title": "Cairn: Refresh History"
+      },
+      {
+        "command": "cairn.runBuildCommand",
+        "title": "Cairn: Run Build Command"
       }
     ],
-    "viewsContainers": {
-      "activitybar": [
-        {
-          "id": "cairn",
-          "title": "Cairn",
-          "icon": "resources/cairn-icon.png"
-        }
-      ]
-    },
     "views": {
-      "cairn": [
+      "explorer": [
         {
           "id": "cairnHistory",
-          "name": "Patch History"
+          "name": "Cairn Patch History"
+        },
+        {
+          "id": "cairnBuildCommands",
+          "name": "Cairn Build Commands"
         }
       ]
     },

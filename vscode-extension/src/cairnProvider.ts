@@ -1,7 +1,6 @@
-import * as vscode from 'vscode';
 import * as path from 'path';
-import { execSync } from 'child_process';
 import { BinaryManager } from './binaryManager';
+import { runCairn } from './cairnUtils';
 
 export interface PatchInfo {
     id: string;
@@ -48,11 +47,7 @@ export class CairnProvider implements vscode.TreeDataProvider<PatchTreeItem> {
             }
 
             // Run cairn list and parse output
-            const cairnPath = await this.binaryManager.getCairnPath();
-            const output = execSync(`"${cairnPath}" list`, {
-                cwd: workspaceFolder.uri.fsPath,
-                encoding: 'utf8'
-            });
+            const output = await runCairn(this.binaryManager, ['list']);
 
             // Parse the output
             // Format: "  #0   mnemonic-words-here (CURRENT, NEWEST)"
@@ -87,22 +82,22 @@ class PatchTreeItem extends vscode.TreeItem {
         this.tooltip = `#${patch.index} ${patch.mnemonic} ${patch.marker}`;
         this.contextValue = 'patch';
 
-        // Use different icons for current vs other patches
+        // White dot for current, black dot for others
         if (patch.marker.includes('CURRENT')) {
-            this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.green'));
+            this.iconPath = new vscode.ThemeIcon('circle-filled');
         } else {
-            this.iconPath = new vscode.ThemeIcon('circle-outline');
+            this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('terminal.ansiBlack'));
+            // Click to rollback (only for non-current patches)
+            this.command = {
+                command: 'cairn.rollback',
+                title: 'Rollback to Patch',
+                arguments: [this]
+            };
         }
-
-        // Store patch ID for commands
-        this.command = {
-            command: 'cairn.showPatch',
-            title: 'Show Patch',
-            arguments: [this]
-        };
     }
 
     get patchId(): string {
         return this.patch.id;
     }
 }
+import * as vscode from 'vscode';

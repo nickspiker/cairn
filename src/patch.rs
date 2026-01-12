@@ -131,9 +131,17 @@ impl Patch {
     }
 }
 
-/// Get Nick Spiker's author ID
-pub fn nick_spiker_author_id() -> AuthorId {
-    *blake3::hash(b"Nick Spiker <nick@spiker.dev>").as_bytes()
+pub fn get_author_id() -> AuthorId {
+    let name = std::env::var("CAIRN_AUTHOR_NAME").unwrap_or_else(|_| "cairn-default-author".to_string());
+    let email = std::env::var("CAIRN_AUTHOR_EMAIL").unwrap_or_else(|_| "".to_string());
+
+    let author_string = if email.is_empty() {
+        name
+    } else {
+        format!("{} <{}>", name, email)
+    };
+
+    *blake3::hash(author_string.as_bytes()).as_bytes()
 }
 
 #[cfg(test)]
@@ -142,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_patch_creation() {
-        let author = nick_spiker_author_id();
+        let author = get_author_id();
         let timestamp = 1234567890.0;
         let build_hash = blake3::hash(b"test build output");
 
@@ -179,8 +187,8 @@ mod tests {
 
     #[test]
     fn test_nick_spiker_author_id() {
-        let author1 = nick_spiker_author_id();
-        let author2 = nick_spiker_author_id();
+        let author1 = get_author_id();
+        let author2 = get_author_id();
 
         // Should be consistent
         assert_eq!(author1, author2);
