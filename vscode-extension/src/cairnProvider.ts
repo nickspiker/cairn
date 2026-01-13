@@ -1,3 +1,4 @@
+import * as vscode from 'vscode';
 import * as path from 'path';
 import { BinaryManager } from './binaryManager';
 import { runCairn } from './cairnUtils';
@@ -100,4 +101,3 @@ class PatchTreeItem extends vscode.TreeItem {
         return this.patch.id;
     }
 }
-import * as vscode from 'vscode';

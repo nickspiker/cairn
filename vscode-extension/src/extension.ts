@@ -135,13 +135,25 @@ async function showPatchDetails(patchId: string): Promise<void> {
 }
 
 async function runBuildCommand(cargoCommand: string): Promise<void> {
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    // Use the active editor's workspace folder, or fall back to first workspace
+    const activeEditor = vscode.window.activeTextEditor;
+    let workspaceFolder = activeEditor
+        ? vscode.workspace.getWorkspaceFolder(activeEditor.document.uri)
+        : undefined;
+
+    if (!workspaceFolder) {
+        workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    }
+
     if (!workspaceFolder) {
         vscode.window.showErrorMessage('No workspace folder open');
         return;
     }
 
     try {
+        // Ensure cargo-cairn is installed (downloads from GitHub if needed)
+        await binaryManager.ensureCargoCairnInstalled();
+
         // Show output in dedicated output channel
         const outputChannel = vscode.window.createOutputChannel('Cairn Build');
         outputChannel.clear();
@@ -168,11 +180,18 @@ async function runBuildCommand(cargoCommand: string): Promise<void> {
     } catch (error: any) {
         const outputChannel = vscode.window.createOutputChannel('Cairn Build');
         outputChannel.appendLine(`Error running cargo cairn ${cargoCommand}:`);
+        outputChannel.appendLine('');
         if (error.stdout) {
+            outputChannel.appendLine('STDOUT:');
             outputChannel.appendLine(error.stdout);
         }
         if (error.stderr) {
+            outputChannel.appendLine('STDERR:');
             outputChannel.appendLine(error.stderr);
+        }
+        if (error.message) {
+            outputChannel.appendLine('ERROR MESSAGE:');
+            outputChannel.appendLine(error.message);
         }
         outputChannel.show();
         vscode.window.showErrorMessage(`Failed to run cargo cairn ${cargoCommand}`);

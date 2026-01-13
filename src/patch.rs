@@ -3,7 +3,6 @@
 //! Cairn uses patch-based version control with VSF encoding.
 //! Each patch represents a state of successful cargo builds.
 
-use blake3::Hash;
 use std::path::PathBuf;
 
 /// Patch ID is a BLAKE3 hash
@@ -28,58 +27,59 @@ pub struct PatchMetadata {
     pub message: String,
 }
 
-/// File and line-based edit operations
+/// Binary diff operations on file content
+///
+/// Operations reference absolute byte positions in the immutable base blob.
+/// All Copy operations read from the base blob, so positions never shift.
 #[derive(Debug, Clone, PartialEq)]
-pub enum LineOp {
-    /// Insert a line after the specified position
-    InsertLine {
-        /// File path
-        file: PathBuf,
-        /// Line number to insert after (0 = before first line)
-        after: usize,
-        /// Content to insert (bytes, no trailing newline)
+pub enum ByteOp {
+    /// Copy bytes from base blob
+    Copy {
+        /// Absolute byte offset in base blob
+        start: usize,
+        /// Number of bytes to copy
+        len: usize,
+    },
+
+    /// Insert new bytes at current output position
+    Insert {
+        /// Content to insert
         content: Vec<u8>,
     },
+}
 
-    /// Delete a line at the specified position
-    DeleteLine {
+/// File operations with binary diffs and blob storage
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileOp {
+    /// Modified file - stores diff from base blob
+    ModifyFile {
         /// File path
-        file: PathBuf,
-        /// Line number to delete
-        at: usize,
-        /// Old content (for undo/verification)
-        old_content: Vec<u8>,
+        path: PathBuf,
+        /// BLAKE3 hash of base content (provenance - identifies blob)
+        base_blob: [u8; 32],
+        /// Binary diff operations
+        operations: Vec<ByteOp>,
+        /// Expected BLAKE3 hash after applying operations (integrity check)
+        result_hash: [u8; 32],
     },
 
-    /// Modify a line at the specified position
-    ModifyLine {
-        /// File path
-        file: PathBuf,
-        /// Line number to modify
-        at: usize,
-        /// Old content
-        old: Vec<u8>,
-        /// New content
-        new: Vec<u8>,
-    },
-
-    /// Add a new file
+    /// New file - stores full content as blob
     AddFile {
         /// File path
         path: PathBuf,
-        /// File content
-        content: Vec<u8>,
+        /// BLAKE3 hash of content (provenance - identifies blob)
+        content_blob: [u8; 32],
     },
 
-    /// Delete a file
+    /// Deleted file
     DeleteFile {
         /// File path
         path: PathBuf,
-        /// Old content (for undo)
-        old_content: Vec<u8>,
+        /// BLAKE3 hash of deleted content (provenance)
+        old_blob: [u8; 32],
     },
 
-    /// Rename a file
+    /// Renamed file - metadata only
     RenameFile {
         /// Source path
         from: PathBuf,
@@ -94,11 +94,11 @@ pub struct Patch {
     /// Patch metadata
     pub metadata: PatchMetadata,
 
-    /// Edit operations to apply
-    pub operations: Vec<LineOp>,
+    /// File operations to apply
+    pub operations: Vec<FileOp>,
 
-    /// BLAKE3 hash of cargo build output (for verification)
-    pub build_hash: Hash,
+    /// BLAKE3 hash of cargo build output (integrity check)
+    pub build_hash: [u8; 32],
 }
 
 impl Patch {
@@ -108,8 +108,8 @@ impl Patch {
         parent: Option<PatchId>,
         timestamp: f64,
         message: String,
-        operations: Vec<LineOp>,
-        build_hash: Hash,
+        operations: Vec<FileOp>,
+        build_hash: [u8; 32],
     ) -> Self {
         Self {
             metadata: PatchMetadata {
@@ -127,7 +127,7 @@ impl Patch {
     pub fn id(&self) -> PatchId {
         // Will be implemented in encode.rs
         // For now, return a placeholder
-        *self.build_hash.as_bytes()
+        self.build_hash
     }
 }
 
@@ -152,7 +152,9 @@ mod tests {
     fn test_patch_creation() {
         let author = get_author_id();
         let timestamp = 1234567890.0;
-        let build_hash = blake3::hash(b"test build output");
+        let build_hash = *blake3::hash(b"test build output").as_bytes();
+
+        let content_blob = *blake3::hash(b"fn main() {\n    println!(\"Hello\");\n}").as_bytes();
 
         let patch = Patch::new(
             author,
@@ -160,20 +162,9 @@ mod tests {
             timestamp,
             "Initial patch".to_string(),
             vec![
-                LineOp::InsertLine {
-                    file: PathBuf::from("src/main.rs"),
-                    after: 0,
-                    content: b"fn main() {".to_vec(),
-                },
-                LineOp::InsertLine {
-                    file: PathBuf::from("src/main.rs"),
-                    after: 1,
-                    content: b"    println!(\"Hello\");".to_vec(),
-                },
-                LineOp::InsertLine {
-                    file: PathBuf::from("src/main.rs"),
-                    after: 2,
-                    content: b"}".to_vec(),
+                FileOp::AddFile {
+                    path: PathBuf::from("src/main.rs"),
+                    content_blob,
                 },
             ],
             build_hash,
@@ -182,7 +173,7 @@ mod tests {
         assert_eq!(patch.metadata.author, author);
         assert_eq!(patch.metadata.parent, None);
         assert_eq!(patch.metadata.message, "Initial patch");
-        assert_eq!(patch.operations.len(), 3);
+        assert_eq!(patch.operations.len(), 1);
     }
 
     #[test]

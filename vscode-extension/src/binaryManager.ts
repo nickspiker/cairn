@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
-import * as crypto from 'crypto';
+import { blake3 } from '@noble/hashes/blake3.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
 import { promisify } from 'util';
 import { exec } from 'child_process';
 
@@ -18,9 +19,89 @@ interface PlatformInfo {
 export class BinaryManager {
     private context: vscode.ExtensionContext;
     private binaryPath: string | null = null;
+    private cargoCairnReady: boolean = false;
 
     constructor(context: vscode.ExtensionContext) {
         this.context = context;
+    }
+
+    /**
+     * Ensure cargo-cairn is installed (for cargo cairn build commands)
+     */
+    async ensureCargoCairnInstalled(): Promise<void> {
+        if (this.cargoCairnReady) {
+            return;
+        }
+
+        // Check if cargo-cairn is already available
+        try {
+            await execAsync('cargo cairn --help');
+            this.cargoCairnReady = true;
+            return;
+        } catch {
+            // Not installed, need to download
+        }
+
+        // Download cargo-cairn to ~/.cargo/bin
+        const platformInfo = this.getPlatformInfo();
+        const version = 'v0.0.0';
+        const baseUrl = `https://github.com/nickspiker/cairn/releases/download/${version}`;
+
+        const binaryName = process.platform === 'win32' ? 'cargo-cairn.exe' : 'cargo-cairn';
+        const downloadName = `cargo-cairn-${platformInfo.platform}-${platformInfo.arch}${process.platform === 'win32' ? '.exe' : ''}`;
+        const binaryUrl = `${baseUrl}/${downloadName}`;
+        const hashUrl = `${binaryUrl}.b3`;
+
+        await vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'Cairn',
+                cancellable: false
+            },
+            async (progress) => {
+                progress.report({ message: 'Installing cargo-cairn...' });
+
+                // Get ~/.cargo/bin path
+                const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+                const cargoBinDir = path.join(homeDir, '.cargo', 'bin');
+
+                if (!fs.existsSync(cargoBinDir)) {
+                    fs.mkdirSync(cargoBinDir, { recursive: true });
+                }
+
+                const destPath = path.join(cargoBinDir, binaryName);
+
+                // Download hash first
+                const expectedHash = await this.downloadText(hashUrl);
+
+                // Download binary using curl (more reliable than https module)
+                const { exec } = require('child_process');
+                const { promisify } = require('util');
+                const execAsync = promisify(exec);
+
+                try {
+                    await execAsync(`curl -L -o "${destPath}" "${binaryUrl}"`);
+                } catch (err: any) {
+                    throw new Error(`Failed to download cargo-cairn: ${err.message}`);
+                }
+
+                progress.report({ message: 'Verifying cargo-cairn...' });
+
+                // Verify BLAKE3 hash
+                const actualHash = await this.blake3Hash(destPath);
+                const expectedHashClean = expectedHash.trim().split(' ')[0];
+                if (actualHash !== expectedHashClean) {
+                    fs.unlinkSync(destPath);
+                    throw new Error(`Binary verification failed. Expected: ${expectedHashClean}, Got: ${actualHash}`);
+                }
+
+                // Make executable
+                fs.chmodSync(destPath, 0o755);
+
+                progress.report({ message: 'cargo-cairn installed!' });
+                this.cargoCairnReady = true;
+            }
+        );
     }
 
     /**
@@ -128,7 +209,7 @@ export class BinaryManager {
      */
     private async downloadBinary(): Promise<string> {
         const platformInfo = this.getPlatformInfo();
-        const version = 'v0.0.0'; // TODO: Make this dynamic from package.json
+        const version = 'v0.0.0';
         const baseUrl = `https://github.com/nickspiker/cairn/releases/download/${version}`;
 
         const binaryUrl = `${baseUrl}/cairn-${platformInfo.platform}-${platformInfo.arch}${process.platform === 'win32' ? '.exe' : ''}`;
@@ -238,7 +319,14 @@ export class BinaryManager {
                                 file.close();
                                 resolve();
                             });
-                        }).on('error', reject);
+                            file.on('error', (err) => {
+                                fs.unlinkSync(dest);
+                                reject(err);
+                            });
+                        }).on('error', (err) => {
+                            fs.unlinkSync(dest);
+                            reject(err);
+                        });
                     }
                 } else if (response.statusCode === 200) {
                     const totalBytes = parseInt(response.headers['content-length'] || '0', 10);
@@ -299,27 +387,11 @@ export class BinaryManager {
     }
 
     /**
-     * Compute BLAKE3 hash of a file
+     * Compute BLAKE3 hash of a file using pure JS implementation
      */
     private async blake3Hash(filePath: string): Promise<string> {
-        // Try using b3sum if available
-        try {
-            const { stdout } = await execAsync(`b3sum "${filePath}"`);
-            return stdout.trim().split(' ')[0];
-        } catch {
-            // Fall back to SHA256 if b3sum not available
-            // TODO: Consider bundling a BLAKE3 JS implementation
-            return this.sha256Hash(filePath);
-        }
-    }
-
-    /**
-     * Compute SHA256 hash as fallback
-     */
-    private sha256Hash(filePath: string): string {
         const fileBuffer = fs.readFileSync(filePath);
-        const hashSum = crypto.createHash('sha256');
-        hashSum.update(fileBuffer);
-        return hashSum.digest('hex');
+        const hash = blake3(fileBuffer);
+        return bytesToHex(hash);
     }
 }

@@ -2,6 +2,8 @@
 
 **Build-gated version control for Rust projects.**
 
+> **Status:** v0.0.1 - Actively tested on Linux. Windows/macOS binaries included but untested. Report issues!
+
 ---
 
 ## The Problem
@@ -14,32 +16,49 @@ Git shows 800 lines across 12 files. You spend 2 hours trying to undo changes. F
 
 ---
 
-## Core Concept: Build-Gated Versioning
+## Quick Start
 
-**Git doesn't know if your code compiles. Cairn only saves states that build.**
+### VSCode Extension (Recommended)
+
+1. Install from VSCode Marketplace: search "Cairn"
+2. Open a Rust project
+3. Click **Build** in the Cairn Build Commands panel
+4. Done! Cairn auto-initializes and creates your first patch
+
+### CLI
 
 ```bash
-$ # Make breaking changes
-$ cargo build
-error[E0425]: cannot find function `parse_token`
-  → Nothing happens. No patch created.
+# Install cargo-cairn (the build wrapper)
+cargo install cairn
 
-$ # Fix the build
-$ cargo build
-    Finished dev [unoptimized + debuginfo] target(s) in 2.34s
-✓ Patch created: maple-crane-forest-pixel-dance
-
-$ cairn list
-● maple-crane-forest-pixel-dance [CURRENT]
-  "Modified 3 files (+47, -23) in decode.rs, apply.rs"
-  2 minutes ago
-
-● cloud-river-stone-bright-moon
-  "Refactored error handling in parser.rs"
-  1 hour ago
+# Use it instead of cargo build
+cargo cairn build
+cargo cairn test
+cargo cairn build --release
 ```
 
-**Every patch in history is guaranteed to build.** No broken states, no guessing.
+On first run, cairn auto-creates `.cairn/` - no init needed.
+
+---
+
+## How It Works
+
+```bash
+$ cargo cairn build
+📸 Cairn: Snapshotting current state...
+   Compiling myproject v0.1.0
+    Finished dev [unoptimized + debuginfo] target(s) in 2.34s
+✓ Cairn: Patch created
+
+$ cairn list
+Patches (newest first):
+
+  #2   maple-crane-forest-pixel-dance (CURRENT, NEWEST)
+  #1   cloud-river-stone-bright-moon
+  #0   swift-ocean-light-paper-wind
+```
+
+**Key insight:** `cargo cairn` snapshots your code BEFORE the build starts, then only commits the patch if the build succeeds. This guarantees the patch matches exactly what was compiled.
 
 ---
 
@@ -47,150 +66,89 @@ $ cairn list
 
 **Automatic patches on successful builds:**
 - Build succeeds → patch created automatically
-- Build fails → nothing happens
+- Build fails → nothing saved
 - No manual commands (compiler is the gatekeeper)
 
 **Instant rollback:**
 ```bash
 $ cairn rollback cloud-river-stone-bright-moon
-✓ Rolled back 10,000 files (47 changed) in 16ms
+✓ Rolled back to patch cloud-river-stone-bright-moon
+  47 files updated
 
 $ cargo build
-    Finished dev in 0.23s  ← Guaranteed to work
+    Finished dev in 0.23s  # Guaranteed to work
 ```
 
-**Mnemonic patch IDs and LLM summary:**
-- Local LLM summarizes edits into 1 sentence
-- Basic stats also show upon hover, patch size, patch file location
+**Mnemonic patch IDs:**
 - 5-word phrases instead of git hashes
 - Easy to remember: "maple-crane-forest-pixel-dance"
-- Fuzzy matching: "maple crane" finds the patch
+- Partial matching: `cairn rollback maple` works
 
-**Slide through time:**
-- Click any patch → instant rollback (no confirmation)
-- Keep clicking to explore history
-- Build with changes → creates new patch, orphans future ones
-
-**VSF-encoded patches:**
-- ~420 bytes typical patch (vs 700+ for JSON)
-- BLAKE3 cryptographic verification
-- Reed-Solomon error correction (2x size, 10000x reliability)
+**VSCode Extension:**
+- Visual patch history in Explorer sidebar
+- Click-to-rollback (white dot = current, black dot = click to go there)
+- Configurable build command buttons
+- No terminal spawning - clean notifications
 
 ---
 
 ## Installation
 
-```bash
-cargo install cairn
-```
+### From Source (Recommended for now)
 
-Or from source:
 ```bash
 git clone https://github.com/nickspiker/cairn
 cd cairn
-cargo build --release
 cargo install --path .
 ```
 
----
+This installs both `cairn` (CLI) and `cargo-cairn` (build wrapper).
 
-## Usage
+### VSCode Extension
 
-**Initialize:**
+Install from marketplace: search "Cairn" by nickspiker
+
+Or install manually:
 ```bash
-$ cd your-rust-project
-$ cairn init
-Initialized .cairn/
-No patches yet - run 'cargo build' to create first
-```
-
-**Build (automatic patch):**
-```bash
-$ cargo build
-    Finished dev in 2.34s
-✓ Patch created: maple-crane-forest-pixel-dance
-  10 files tracked
-```
-
-**List history:**
-```bash
-$ cairn list
-● maple-crane-forest [CURRENT] - 2 min ago
-  "Modified decode.rs, apply.rs (+47, -23)"
-  
-● cloud-river-stone - 1 hr ago
-  "Refactored error handling"
-
-○ swift-ocean-light - yesterday
-  "Initial commit"
-```
-
-**Rollback:**
-```bash
-$ cairn rollback cloud-river
-✓ Restored to cloud-river-stone-bright-moon (1 hour ago)
-  47 files changed in 23ms
-
-$ cargo build
-    Finished dev in 0.31s
-```
-
-**Fuzzy matching works:**
-```bash
-$ cairn rollback maple    # Finds maple-crane-forest-pixel-dance
-$ cairn rollback cloud r  # Finds cloud-river-stone-bright-moon
+cd vscode-extension
+npm install
+npm run compile
+vsce package
+# Then: Extensions → Install from VSIX
 ```
 
 ---
 
-## VSCode Extension
+## CLI Reference
 
-Install from marketplace: `cairn`
+```bash
+cairn                    # Show help
+cairn init               # Initialize .cairn/ (optional - auto-inits on first build)
+cairn list               # List all patches
+cairn show <patch-id>    # Show patch details
+cairn rollback <patch-id> # Rollback to a patch
 
-**Features:**
-- Auto-patch on successful build
-- Visual timeline with mnemonics
-- Hover for AI-generated summaries
-- Click patch → instant rollback
-- Orphaned patches section
-
-```
-HISTORY
-● maple-crane-forest-pixel-dance [CURRENT]
-  ↑ Hover: "Refactored error handling in decode.rs..."
-  ↑ Click: instant rollback
-
-● cloud-river-stone-bright-moon
-● swift-ocean-light-paper-wind
-
-ORPHANED (parent: cloud-river-stone)
-○ broken-attempt-one
-○ broken-attempt-two
-  (These were orphaned when you rolled back and built)
+cargo cairn build        # Build with auto-snapshot
+cargo cairn test         # Test with auto-snapshot
+cargo cairn build --release  # Release build with auto-snapshot
 ```
 
 ---
 
-## How It Works
+## VSCode Extension Settings
 
-**Build-gated capture:**
-1. `cargo build` succeeds
-2. Check if files changed (prevent duplicate patches)
-3. Compute delta from current state
-4. Create VSF-encoded patch
-5. Store in `.cairn/patches/`
+Configure build commands in settings.json:
 
-**Race condition solved:** Uses cargo's fingerprint to capture exactly what was compiled, not current disk state.
-
-**Atomic rollback:**
-1. Build file tree in temp directory
-2. Hardlink unchanged files (zero copy)
-3. Atomic directory swap (`rename` is atomic)
-4. Update state file (Reed-Solomon protected)
-
-If crash happens: repo stays consistent, recovery on next startup.
-
-**Orphaning:** After rollback + build with changes, future patches move to ORPHANED section. Nothing is lost—you can restore orphaned patches.
+```json
+{
+  "cairn.buildCommands": [
+    {"label": "Build", "command": "build", "icon": "tools"},
+    {"label": "Release", "command": "build --release", "icon": "rocket"},
+    {"label": "Test", "command": "test", "icon": "beaker"},
+    {"label": "Check", "command": "check", "icon": "check"}
+  ]
+}
+```
 
 ---
 
@@ -199,44 +157,23 @@ If crash happens: repo stays consistent, recovery on next startup.
 **Repository structure:**
 ```
 .cairn/
-├── state.vsf              # Current state + history
-├── patches/               # VSF-encoded patches (by provenance hash)
-│   └── xiN2nO...lKI.vsf
-└── objects/               # Content-addressed storage
-    └── a3/f8d9e1...
+├── state.vsf           # Current state + patch list
+└── patches/            # VSF-encoded patches (content-addressed)
+    ├── xiN2nO...lKI
+    └── a3f8d9...e1b
 ```
 
-**Patch format:**
-```rust
-struct Patch {
-    metadata: {
-        author: [u8; 32],       // BLAKE3("Nick Spiker <email>")
-        parent: Option<PatchId>,
-        timestamp: f64,
-        ai_summary: String,     // Auto-generated
-    },
-    delta: Vec<Change> {
-        InsertLine { file, after, content },
-        DeleteLine { file, at, old_content },
-        ModifyLine { file, at, old, new },
-        AddFile { path, content },
-        DeleteFile { path, old_content },
-        RenameFile { from, to },
-    },
-    build_hash: [u8; 32],
-}
-```
+**Patch format (VSF-encoded):**
+- Author ID (BLAKE3 hash of git user.name + email)
+- Parent patch pointer (cryptographic chain)
+- Timestamp
+- Delta operations (InsertLine, DeleteLine, AddFile, etc.)
+- Build hash
 
-**AI summaries:** Generated using embedded `lm.rs` model (~50MB, zero dependencies). Example: "Refactored error handling in decode.rs, added empty section support"
-
-**Terminology:**
-- **State**: Repository snapshot (`.cairn/state.vsf`)
-- **Patch**: VSF file containing delta + metadata
-- **Delta**: Set of changes in a patch
-- **Change**: Single operation (InsertLine, AddFile, etc.)
-- **History**: Chronological chain of patches
-- **Current**: Active patch (working directory state)
-- **Orphaned**: Patches cut off after rollback + new build
+**Excluded from snapshots:**
+- `.cairn/`, `target/`, `.git/`, `node_modules/`, `out/`, `dist/`
+- `*.vsix`, `*.wasm`, `Cargo.lock`, `package-lock.json`
+- Hidden files (`.env`, etc.)
 
 ---
 
@@ -246,55 +183,36 @@ Cairn complements Git—use both:
 - **Git** for commits, branches, collaboration
 - **Cairn** for build-gated local snapshots
 
-Cairn doesn't replace Git's collaboration features. It solves a different problem: "give me the last state that compiled."
+Cairn doesn't replace Git. It solves a different problem: "give me the last state that compiled."
 
----
-
-## Prior Art
-
-Built on:
-- **Pijul/Darcs** - Patch theory with commutation
-- **Git** - Content-addressed storage
-- **BTRFS** - Copy-on-write snapshots
-
-Novel contributions:
-- Build-gated snapshots (not time/manual)
-- Cargo fingerprint for race-free capture
-- Mnemonic patch IDs (5-word phrases)
-- VSF encoding (efficient, verified)
-- Hardlink optimization (instant rollback)
-- Embedded AI summaries (zero dependencies)
+```bash
+# Typical workflow
+git checkout -b feature
+cargo cairn build    # Snapshot as you develop
+cargo cairn build    # Each successful build = new patch
+cairn rollback ...   # Oops, go back
+cargo cairn build    # Try again
+git add -A && git commit  # When ready, commit to git
+```
 
 ---
 
 ## Current Limitations
 
-**Linear history:**
-- No merges yet (coming with patch commutation)
-- Multi-dev: rebase required
-- Orphaned patches handle divergence
-
-**Rust-only:**
-- Assumes `cargo build`
-- Multi-language support planned
-
-**Local-only:**
-- No remote sync yet
-- Copy `.cairn/` to sync manually
+- **Linear history** - No merges yet
+- **Rust-only** - Assumes cargo build (other languages planned)
+- **Local-only** - No remote sync yet
+- **Linux tested** - Windows/macOS builds included but untested
 
 ---
 
 ## Roadmap
 
-**v0.1.0** (Week 2):
-- Patch commutation (merge support)
-- Multi-developer workflows
-- Conflict detection
-
-**v0.2.0** (Week 3):
-- Cloud sync (encrypted)
-- TOKEN-signed patches
-- Multi-language support
+- [ ] LLM-generated patch summaries on hover
+- [ ] Orphaned patches section (diverged history)
+- [ ] Reed-Solomon error correction
+- [ ] Multi-language support
+- [ ] Cloud sync
 
 ---
 
@@ -306,27 +224,7 @@ MIT or Apache-2.0, your choice.
 
 ## Author
 
-**Nick Spiker**
-
-Building correct tools from first principles:
-- [Spirix](https://github.com/nickspiker/spirix) - Two's complement floating point
-- [TOKEN](https://github.com/nickspiker/token) - Cryptographic identity
-- [VSF](https://github.com/nickspiker/vsf) - Versatile Storage Format
-- [ferros](https://ferros.org) - Kill-switch ready OS
-
----
-
-## Contributing
-
-Pull requests welcome.
-
-Before contributing:
-- Read `AGENT.md` for guidelines
-- All tests must pass (`cargo test`)
-- No bounds checks without proof
-- Use VSF high-level APIs only
-
-Questions? Open an issue.
+**Nick Spiker** - Building correct tools from first principles.
 
 ---
 

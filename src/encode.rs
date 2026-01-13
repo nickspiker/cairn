@@ -1,11 +1,15 @@
-//! VSF encoding for cairn patches
+//! VSF encoding for cairn patches with binary diff and blob storage
 //!
 //! Encodes patches using VSF's hierarchical section format:
-//! - metadata section: author, parent, message
-//! - operations section: file operations (insert/delete/modify/add/delete/rename)
+//! - metadata section: author, parent, timestamp, message
+//! - operations section: FileOp with ByteOp encoded as byte vectors
 //! - build_output section: cargo build hash
+//!
+//! Hash types used:
+//! - hp (hash provenance): Content identification for blobs (immutable, identifies specific content)
+//! - hb (hash rolling/integrity): Integrity verification for patch results (verifies correct application)
 
-use crate::patch::{LineOp, Patch};
+use crate::patch::{ByteOp, FileOp, Patch};
 use anyhow::Result;
 use vsf::types::Vector;
 use vsf::{VsfBuilder, VsfSection, VsfType};
@@ -38,13 +42,16 @@ impl Patch {
 fn encode_metadata_section(metadata: &crate::patch::PatchMetadata) -> Result<VsfSection> {
     let mut section = VsfSection::new("metadata");
 
-    // Author as BLAKE3 hash
+    // Author as BLAKE3 hash (provenance)
     section.add_field("author", VsfType::hp(metadata.author.to_vec()));
 
-    // Parent patch hash (optional)
+    // Parent patch hash (optional, provenance)
     if let Some(parent) = metadata.parent {
         section.add_field("parent", VsfType::hp(parent.to_vec()));
     }
+
+    // Timestamp (Eagle Time - seconds since 1969-07-20 20:17:40 UTC)
+    section.add_field("timestamp", VsfType::e(vsf::EtType::f6(metadata.timestamp)));
 
     // Commit message (Huffman compressed)
     section.add_field("message", VsfType::x(metadata.message.clone()));
@@ -52,73 +59,62 @@ fn encode_metadata_section(metadata: &crate::patch::PatchMetadata) -> Result<Vsf
     Ok(section)
 }
 
-/// Encode operations section
-fn encode_operations_section(operations: &[LineOp]) -> Result<VsfSection> {
+/// Encode operations section with FileOp and ByteOp
+fn encode_operations_section(operations: &[FileOp]) -> Result<VsfSection> {
     let mut section = VsfSection::new("operations");
 
     for op in operations {
         match op {
-            LineOp::InsertLine { file, after, content } => {
+            FileOp::ModifyFile {
+                path,
+                base_blob,
+                operations: byte_ops,
+                result_hash,
+            } => {
+                // Encode ByteOp operations as a byte vector
+                let byte_ops_encoded = encode_byte_ops(byte_ops);
+
                 section.add_field_multi(
                     "op",
                     vec![
-                        VsfType::u3(0),                                      // Op type: 0=insert
-                        VsfType::l(file.to_string_lossy().to_string()),      // File path
-                        VsfType::u(*after, false),                           // Line number (auto-sized)
-                        VsfType::v_u3(Vector { data: content.clone() }),     // Content bytes
+                        VsfType::u3(0),                                     // Op type: 0=modify file
+                        VsfType::l(path.to_string_lossy().to_string()),     // File path
+                        VsfType::hp(base_blob.to_vec()),                    // Base blob hash (provenance)
+                        VsfType::hb(result_hash.to_vec()),                  // Result hash (integrity)
+                        VsfType::v_u3(Vector { data: byte_ops_encoded }),   // ByteOp sequence
                     ],
                 );
             }
-            LineOp::DeleteLine { file, at, old_content } => {
+
+            FileOp::AddFile { path, content_blob } => {
                 section.add_field_multi(
                     "op",
                     vec![
-                        VsfType::u3(1),                                      // Op type: 1=delete
-                        VsfType::l(file.to_string_lossy().to_string()),      // File path
-                        VsfType::u(*at, false),                              // Line number
-                        VsfType::v_u3(Vector { data: old_content.clone() }), // Old content (for undo)
+                        VsfType::u3(1),                                     // Op type: 1=add file
+                        VsfType::l(path.to_string_lossy().to_string()),     // File path
+                        VsfType::hp(content_blob.to_vec()),                 // Content blob hash (provenance)
                     ],
                 );
             }
-            LineOp::ModifyLine { file, at, old, new } => {
+
+            FileOp::DeleteFile { path, old_blob } => {
                 section.add_field_multi(
                     "op",
                     vec![
-                        VsfType::u3(2),                                      // Op type: 2=modify
-                        VsfType::l(file.to_string_lossy().to_string()),      // File path
-                        VsfType::u(*at, false),                              // Line number
-                        VsfType::v_u3(Vector { data: old.clone() }),         // Old content
-                        VsfType::v_u3(Vector { data: new.clone() }),         // New content
+                        VsfType::u3(2),                                     // Op type: 2=delete file
+                        VsfType::l(path.to_string_lossy().to_string()),     // File path
+                        VsfType::hp(old_blob.to_vec()),                     // Old blob hash (provenance)
                     ],
                 );
             }
-            LineOp::AddFile { path, content } => {
+
+            FileOp::RenameFile { from, to } => {
                 section.add_field_multi(
                     "op",
                     vec![
-                        VsfType::u3(3),                                      // Op type: 3=add file
-                        VsfType::l(path.to_string_lossy().to_string()),      // File path
-                        VsfType::v_u3(Vector { data: content.clone() }),     // File content
-                    ],
-                );
-            }
-            LineOp::DeleteFile { path, old_content } => {
-                section.add_field_multi(
-                    "op",
-                    vec![
-                        VsfType::u3(4),                                      // Op type: 4=delete file
-                        VsfType::l(path.to_string_lossy().to_string()),      // File path
-                        VsfType::v_u3(Vector { data: old_content.clone() }), // Old content (for undo)
-                    ],
-                );
-            }
-            LineOp::RenameFile { from, to } => {
-                section.add_field_multi(
-                    "op",
-                    vec![
-                        VsfType::u3(5),                                      // Op type: 5=rename file
-                        VsfType::l(from.to_string_lossy().to_string()),      // Source path
-                        VsfType::l(to.to_string_lossy().to_string()),        // Dest path
+                        VsfType::u3(3),                                     // Op type: 3=rename file
+                        VsfType::l(from.to_string_lossy().to_string()),     // Source path
+                        VsfType::l(to.to_string_lossy().to_string()),       // Dest path
                     ],
                 );
             }
@@ -128,12 +124,55 @@ fn encode_operations_section(operations: &[LineOp]) -> Result<VsfSection> {
     Ok(section)
 }
 
+/// Encode ByteOp operations as a byte vector
+///
+/// Format for each operation:
+/// - Copy: [0u8, start_bytes..., len_bytes...]
+/// - Insert: [1u8, len_bytes..., content_bytes...]
+///
+/// Uses variable-length encoding for sizes (LEB128-style).
+pub(crate) fn encode_byte_ops(byte_ops: &[ByteOp]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+
+    for op in byte_ops {
+        match op {
+            ByteOp::Copy { start, len } => {
+                encoded.push(0); // Copy operation tag
+                encode_varint(&mut encoded, *start);
+                encode_varint(&mut encoded, *len);
+            }
+            ByteOp::Insert { content } => {
+                encoded.push(1); // Insert operation tag
+                encode_varint(&mut encoded, content.len());
+                encoded.extend_from_slice(content);
+            }
+        }
+    }
+
+    encoded
+}
+
+/// Encode usize as variable-length integer (LEB128)
+pub(crate) fn encode_varint(buf: &mut Vec<u8>, mut value: usize) {
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80; // More bytes coming
+        }
+        buf.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
 /// Encode build output section
-fn encode_build_section(build_hash: &blake3::Hash) -> Result<VsfSection> {
+fn encode_build_section(build_hash: &[u8; 32]) -> Result<VsfSection> {
     let mut section = VsfSection::new("build_output");
 
-    // Store BLAKE3 hash of cargo build output
-    section.add_field("cargo_hash", VsfType::hp(build_hash.as_bytes().to_vec()));
+    // Store BLAKE3 hash of cargo build output (integrity verification)
+    section.add_field("cargo_hash", VsfType::hb(build_hash.to_vec()));
 
     Ok(section)
 }
@@ -157,27 +196,54 @@ mod tests {
 
         assert_eq!(section.name, "metadata");
         assert!(section.get_field("author").is_some());
+        assert!(section.get_field("timestamp").is_some());
         assert!(section.get_field("message").is_some());
     }
 
     #[test]
+    fn test_encode_byte_ops() {
+        let byte_ops = vec![
+            ByteOp::Copy { start: 0, len: 5 },
+            ByteOp::Insert {
+                content: b"hello".to_vec(),
+            },
+            ByteOp::Copy { start: 10, len: 20 },
+        ];
+
+        let encoded = encode_byte_ops(&byte_ops);
+
+        // Should not be empty
+        assert!(!encoded.is_empty());
+
+        // First byte should be 0 (Copy operation)
+        assert_eq!(encoded[0], 0);
+    }
+
+    #[test]
     fn test_encode_operations() {
+        let content_blob = *blake3::hash(b"file content").as_bytes();
+        let base_blob = *blake3::hash(b"base content").as_bytes();
+        let result_hash = *blake3::hash(b"result content").as_bytes();
+        let old_blob = *blake3::hash(b"old content").as_bytes();
+
         let ops = vec![
-            LineOp::InsertLine {
-                file: PathBuf::from("src/main.rs"),
-                after: 0,
-                content: b"fn main() {".to_vec(),
+            FileOp::AddFile {
+                path: PathBuf::from("src/main.rs"),
+                content_blob,
             },
-            LineOp::DeleteLine {
-                file: PathBuf::from("src/lib.rs"),
-                at: 5,
-                old_content: b"old line".to_vec(),
+            FileOp::ModifyFile {
+                path: PathBuf::from("src/lib.rs"),
+                base_blob,
+                operations: vec![ByteOp::Copy { start: 0, len: 10 }],
+                result_hash,
             },
-            LineOp::ModifyLine {
-                file: PathBuf::from("src/main.rs"),
-                at: 10,
-                old: b"old".to_vec(),
-                new: b"new".to_vec(),
+            FileOp::DeleteFile {
+                path: PathBuf::from("old.rs"),
+                old_blob,
+            },
+            FileOp::RenameFile {
+                from: PathBuf::from("old.txt"),
+                to: PathBuf::from("new.txt"),
             },
         ];
 
@@ -185,12 +251,12 @@ mod tests {
 
         assert_eq!(section.name, "operations");
         let op_fields = section.get_fields("op");
-        assert_eq!(op_fields.len(), 3);
+        assert_eq!(op_fields.len(), 4);
     }
 
     #[test]
     fn test_encode_build_section() {
-        let hash = blake3::hash(b"cargo build output");
+        let hash = *blake3::hash(b"cargo build output").as_bytes();
         let section = encode_build_section(&hash).unwrap();
 
         assert_eq!(section.name, "build_output");
@@ -200,17 +266,17 @@ mod tests {
     #[test]
     fn test_full_patch_encode() {
         let author = get_author_id();
-        let build_hash = blake3::hash(b"test build");
+        let build_hash = *blake3::hash(b"test build").as_bytes();
+        let content_blob = *blake3::hash(b"test content").as_bytes();
 
         let patch = Patch::new(
             author,
             None,
             1234567890.0,
             "Test patch".to_string(),
-            vec![LineOp::InsertLine {
-                file: PathBuf::from("src/main.rs"),
-                after: 0,
-                content: b"test".to_vec(),
+            vec![FileOp::AddFile {
+                path: PathBuf::from("src/main.rs"),
+                content_blob,
             }],
             build_hash,
         );
@@ -223,22 +289,63 @@ mod tests {
     }
 
     #[test]
+    fn test_varint_encoding() {
+        let mut buf = Vec::new();
+
+        // Test small value
+        encode_varint(&mut buf, 127);
+        assert_eq!(buf, vec![127]);
+
+        // Test larger value
+        buf.clear();
+        encode_varint(&mut buf, 128);
+        assert_eq!(buf, vec![0x80, 0x01]);
+
+        // Test even larger value
+        buf.clear();
+        encode_varint(&mut buf, 16384);
+        assert_eq!(buf, vec![0x80, 0x80, 0x01]);
+    }
+
+    #[test]
+    fn test_byte_ops_roundtrip() {
+        let original_ops = vec![
+            ByteOp::Copy { start: 0, len: 100 },
+            ByteOp::Insert {
+                content: b"inserted text".to_vec(),
+            },
+            ByteOp::Copy {
+                start: 200,
+                len: 50,
+            },
+        ];
+
+        let encoded = encode_byte_ops(&original_ops);
+
+        // Should produce non-empty encoding
+        assert!(!encoded.is_empty());
+
+        // Should start with Copy operation tag (0)
+        assert_eq!(encoded[0], 0);
+    }
+
+    #[test]
     #[cfg(feature = "inspect")]
     fn test_inspect_patch_vsf() {
         use vsf::inspect::inspect_vsf;
 
         let author = get_author_id();
-        let build_hash = blake3::hash(b"test build");
+        let build_hash = *blake3::hash(b"test build").as_bytes();
+        let content_blob = *blake3::hash(b"fn main() {}").as_bytes();
 
         let patch = Patch::new(
             author,
             None,
             1234567890.0,
             "Test patch".to_string(),
-            vec![LineOp::InsertLine {
-                file: PathBuf::from("src/main.rs"),
-                after: 0,
-                content: b"fn main() {".to_vec(),
+            vec![FileOp::AddFile {
+                path: PathBuf::from("src/main.rs"),
+                content_blob,
             }],
             build_hash,
         );

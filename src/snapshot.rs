@@ -35,7 +35,7 @@ pub fn create_snapshot_from_files(
     let previous_files = get_previous_files(&repo_state, cairn_dir)?;
 
     // Compute delta operations
-    let operations = diff::compute_diff(&previous_files, &current_files)
+    let operations = diff::compute_diff(cairn_dir, &previous_files, &current_files)
         .context("Failed to compute delta")?;
 
     if operations.is_empty() {
@@ -64,7 +64,7 @@ pub fn create_snapshot_from_files(
         timestamp,
         message,
         operations,
-        build_hash,
+        *build_hash.as_bytes(),
     );
 
     // Encode patch to VSF
@@ -202,7 +202,7 @@ pub fn get_previous_files(
         let patch = crate::patch::Patch::decode_vsf(&patch_bytes)
             .context("Failed to decode patch")?;
 
-        current_files = crate::apply::apply_operations(&current_files, &patch.operations)?;
+        current_files = crate::apply::apply_operations(cairn_dir, &current_files, &patch.operations)?;
     }
 
     Ok(current_files)

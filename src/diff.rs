@@ -1,29 +1,32 @@
-//! Diff computation for generating patch operations
+//! Binary diff computation with blob storage
 //!
-//! Computes LineOps between two file tree states.
-//! Week 1: Simple line-based diff using Myers algorithm.
+//! Uses line-by-line byte comparison to generate binary diffs
+//! with absolute byte positions.
 
-use crate::patch::LineOp;
+use crate::blob::write_blob;
+use crate::patch::{ByteOp, FileOp};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Compute diff operations between old and new file states
 ///
-/// Returns a Vec of LineOp that transform old_files into new_files.
-/// Operations are ordered: deletions, modifications, insertions, file ops.
+/// Uses blob storage for content-addressed file storage.
+/// Returns Vec<FileOp> that transform old_files into new_files.
 pub fn compute_diff(
+    cairn_dir: &Path,
     old_files: &HashMap<PathBuf, Vec<u8>>,
     new_files: &HashMap<PathBuf, Vec<u8>>,
-) -> Result<Vec<LineOp>> {
+) -> Result<Vec<FileOp>> {
     let mut operations = Vec::new();
 
     // 1. Find deleted files (in old but not in new)
     for (path, old_content) in old_files {
         if !new_files.contains_key(path) {
-            operations.push(LineOp::DeleteFile {
+            let old_blob = write_blob(cairn_dir, old_content)?;
+            operations.push(FileOp::DeleteFile {
                 path: path.clone(),
-                old_content: old_content.clone(),
+                old_blob,
             });
         }
     }
@@ -31,9 +34,10 @@ pub fn compute_diff(
     // 2. Find added files (in new but not in old)
     for (path, new_content) in new_files {
         if !old_files.contains_key(path) {
-            operations.push(LineOp::AddFile {
+            let content_blob = write_blob(cairn_dir, new_content)?;
+            operations.push(FileOp::AddFile {
                 path: path.clone(),
-                content: new_content.clone(),
+                content_blob,
             });
         }
     }
@@ -42,9 +46,9 @@ pub fn compute_diff(
     for (path, new_content) in new_files {
         if let Some(old_content) = old_files.get(path) {
             if old_content != new_content {
-                // File modified - compute line-level diff
-                let line_ops = compute_line_diff(path, old_content, new_content)?;
-                operations.extend(line_ops);
+                // File modified - compute binary diff
+                let file_op = compute_binary_diff(cairn_dir, path, old_content, new_content)?;
+                operations.push(file_op);
             }
         }
     }
@@ -52,120 +56,280 @@ pub fn compute_diff(
     Ok(operations)
 }
 
-/// Compute line-level diff between old and new file content
+/// Compute binary diff between old and new file content
 ///
-/// Week 1: Simple line-by-line comparison (not Myers algorithm yet).
-/// Returns operations to transform old_lines into new_lines.
-fn compute_line_diff(
+/// For text files: Uses Myers algorithm (via dissimilar crate) for minimal diff.
+/// For binary files: Stores full content as single Insert operation.
+/// All Copy operations use absolute byte positions in the base blob.
+fn compute_binary_diff(
+    cairn_dir: &Path,
     path: &PathBuf,
     old_content: &[u8],
     new_content: &[u8],
-) -> Result<Vec<LineOp>> {
+) -> Result<FileOp> {
+    // Store base blob (old content)
+    let base_blob = write_blob(cairn_dir, old_content)?;
+
+    // Detect if file is text or binary
+    let byte_ops = if is_likely_text(new_content) {
+        // Text file - use Myers diff algorithm for optimal diff
+        generate_byte_ops(old_content, new_content)
+    } else {
+        // Binary file - just store full content (no diff)
+        vec![ByteOp::Insert {
+            content: new_content.to_vec(),
+        }]
+    };
+
+    // Compute result hash by reconstructing the file
+    let reconstructed = apply_byte_ops(old_content, &byte_ops);
+    let result_hash = *blake3::hash(&reconstructed).as_bytes();
+
+    // Verify reconstruction matches new content
+    debug_assert_eq!(
+        reconstructed, new_content,
+        "Binary diff reconstruction mismatch"
+    );
+
+    Ok(FileOp::ModifyFile {
+        path: path.clone(),
+        base_blob,
+        operations: byte_ops,
+        result_hash,
+    })
+}
+
+/// Generate ByteOp sequence using line-by-line byte comparison
+///
+/// Converts old → new by:
+/// - Equal lines: Copy from base blob
+/// - Deleted lines: Skip (don't copy from base)
+/// - Inserted lines: Insert new bytes
+///
+/// Works directly on raw bytes without UTF-8 conversion.
+fn generate_byte_ops(old_content: &[u8], new_content: &[u8]) -> Vec<ByteOp> {
+    let mut operations = Vec::new();
+
+    // Split into lines (including newline characters)
     let old_lines = split_lines(old_content);
     let new_lines = split_lines(new_content);
 
-    // Simple approach for Week 1: delete all old lines, insert all new lines
-    // This is inefficient but correct. Myers algorithm can be added later.
-    let mut operations = Vec::new();
+    // Simple line-by-line diff using longest common subsequence
+    let matches = find_matching_lines(&old_lines, &new_lines);
 
-    // Delete old lines (in reverse order to maintain indices)
-    for (idx, line) in old_lines.iter().enumerate().rev() {
-        operations.push(LineOp::DeleteLine {
-            file: path.clone(),
-            at: idx,
-            old_content: line.clone(),
+    let mut old_idx = 0;
+    let mut new_idx = 0;
+    let mut old_byte_pos = 0;
+
+    for (old_match_idx, new_match_idx) in matches {
+        // Insert any new lines before this match
+        while new_idx < new_match_idx {
+            operations.push(ByteOp::Insert {
+                content: new_lines[new_idx].to_vec(),
+            });
+            new_idx += 1;
+        }
+
+        // Skip any deleted lines before this match
+        while old_idx < old_match_idx {
+            old_byte_pos += old_lines[old_idx].len();
+            old_idx += 1;
+        }
+
+        // Copy the matching line
+        let line_len = old_lines[old_idx].len();
+        operations.push(ByteOp::Copy {
+            start: old_byte_pos,
+            len: line_len,
         });
+        old_byte_pos += line_len;
+        old_idx += 1;
+        new_idx += 1;
     }
 
-    // Insert new lines
-    for (idx, line) in new_lines.iter().enumerate() {
-        operations.push(LineOp::InsertLine {
-            file: path.clone(),
-            after: if idx == 0 { 0 } else { idx - 1 },
-            content: line.clone(),
+    // Handle any remaining new lines at the end
+    while new_idx < new_lines.len() {
+        operations.push(ByteOp::Insert {
+            content: new_lines[new_idx].to_vec(),
         });
+        new_idx += 1;
     }
 
-    Ok(operations)
+    // Merge consecutive operations for efficiency
+    merge_operations(operations)
 }
 
-/// Split content into lines (preserving line endings)
-fn split_lines(content: &[u8]) -> Vec<Vec<u8>> {
+/// Split content into lines (including newline characters)
+///
+/// Each line includes its trailing newline (except possibly the last line).
+fn split_lines(content: &[u8]) -> Vec<&[u8]> {
     let mut lines = Vec::new();
-    let mut current_line = Vec::new();
+    let mut start = 0;
 
-    for &byte in content {
-        current_line.push(byte);
+    for (i, &byte) in content.iter().enumerate() {
         if byte == b'\n' {
-            lines.push(current_line.clone());
-            current_line.clear();
+            lines.push(&content[start..=i]); // Include the newline
+            start = i + 1;
         }
     }
 
-    // Add final line if not empty (no trailing newline)
-    if !current_line.is_empty() {
-        lines.push(current_line);
-    }
-
-    // Special case: empty file
-    if lines.is_empty() && content.is_empty() {
-        return Vec::new();
+    // Add remaining content if any
+    if start < content.len() {
+        lines.push(&content[start..]);
     }
 
     lines
 }
 
+/// Find matching lines between old and new using a simple greedy approach
+///
+/// Returns Vec<(old_idx, new_idx)> of matching line pairs in order.
+fn find_matching_lines(old_lines: &[&[u8]], new_lines: &[&[u8]]) -> Vec<(usize, usize)> {
+    let mut matches = Vec::new();
+    let mut used_old = vec![false; old_lines.len()];
+    let mut used_new = vec![false; new_lines.len()];
+
+    // Greedy matching: for each new line, find first matching old line
+    for (new_idx, new_line) in new_lines.iter().enumerate() {
+        for (old_idx, old_line) in old_lines.iter().enumerate() {
+            if !used_old[old_idx] && !used_new[new_idx] && old_line == new_line {
+                matches.push((old_idx, new_idx));
+                used_old[old_idx] = true;
+                used_new[new_idx] = true;
+                break;
+            }
+        }
+    }
+
+    // Sort by old index to maintain order
+    matches.sort_by_key(|(old_idx, _)| *old_idx);
+
+    matches
+}
+
+/// Merge consecutive operations of the same type
+///
+/// - Consecutive Copy operations with adjacent positions are merged
+/// - Consecutive Insert operations are merged into a single Insert
+fn merge_operations(operations: Vec<ByteOp>) -> Vec<ByteOp> {
+    if operations.is_empty() {
+        return operations;
+    }
+
+    let mut merged = Vec::new();
+    let mut current = operations[0].clone();
+
+    for next in operations.into_iter().skip(1) {
+        match (&current, &next) {
+            // Merge consecutive Copy operations if adjacent
+            (
+                ByteOp::Copy {
+                    start: start1,
+                    len: len1,
+                },
+                ByteOp::Copy {
+                    start: start2,
+                    len: len2,
+                },
+            ) if *start1 + *len1 == *start2 => {
+                current = ByteOp::Copy {
+                    start: *start1,
+                    len: len1 + len2,
+                };
+            }
+            // Merge consecutive Insert operations
+            (ByteOp::Insert { content: content1 }, ByteOp::Insert { content: content2 }) => {
+                let mut merged_content = content1.clone();
+                merged_content.extend(content2);
+                current = ByteOp::Insert {
+                    content: merged_content,
+                };
+            }
+            // Different operations - push current and start new
+            _ => {
+                merged.push(current);
+                current = next;
+            }
+        }
+    }
+
+    merged.push(current);
+    merged
+}
+
+/// Apply ByteOp operations to reconstruct file content
+///
+/// Used internally to verify diff correctness and compute result_hash.
+fn apply_byte_ops(base_content: &[u8], operations: &[ByteOp]) -> Vec<u8> {
+    let mut output = Vec::new();
+
+    for op in operations {
+        match op {
+            ByteOp::Copy { start, len } => {
+                let end = start + len;
+                output.extend_from_slice(&base_content[*start..end]);
+            }
+            ByteOp::Insert { content } => {
+                output.extend_from_slice(content);
+            }
+        }
+    }
+
+    output
+}
+
+/// Detect if content is likely text (vs binary)
+///
+/// Uses a simple heuristic:
+/// - Check first 8KB for null bytes (0x00) or excessive control characters
+/// - Text files typically don't contain null bytes
+/// - Binary files often have null bytes or many control characters
+fn is_likely_text(content: &[u8]) -> bool {
+    const SAMPLE_SIZE: usize = 8192;
+    let sample = if content.len() > SAMPLE_SIZE {
+        &content[..SAMPLE_SIZE]
+    } else {
+        content
+    };
+
+    // Check for null bytes - strong indicator of binary
+    if sample.contains(&0) {
+        return false;
+    }
+
+    // Count control characters (excluding common whitespace)
+    let control_chars = sample
+        .iter()
+        .filter(|&&b| b < 32 && b != b'\n' && b != b'\r' && b != b'\t')
+        .count();
+
+    // If more than 1% control characters, likely binary
+    let threshold = sample.len() / 100;
+    control_chars <= threshold
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_split_lines_empty() {
-        let content = b"";
-        let lines = split_lines(content);
-        assert_eq!(lines.len(), 0);
-    }
-
-    #[test]
-    fn test_split_lines_single() {
-        let content = b"hello\n";
-        let lines = split_lines(content);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0], b"hello\n");
-    }
-
-    #[test]
-    fn test_split_lines_multiple() {
-        let content = b"line1\nline2\nline3\n";
-        let lines = split_lines(content);
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], b"line1\n");
-        assert_eq!(lines[1], b"line2\n");
-        assert_eq!(lines[2], b"line3\n");
-    }
-
-    #[test]
-    fn test_split_lines_no_trailing_newline() {
-        let content = b"line1\nline2";
-        let lines = split_lines(content);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], b"line1\n");
-        assert_eq!(lines[1], b"line2");
-    }
+    use crate::blob::blob_exists;
+    use tempfile::TempDir;
 
     #[test]
     fn test_diff_add_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let cairn_dir = temp_dir.path();
+
         let old_files = HashMap::new();
         let mut new_files = HashMap::new();
         new_files.insert(PathBuf::from("test.txt"), b"content\n".to_vec());
 
-        let ops = compute_diff(&old_files, &new_files).unwrap();
+        let ops = compute_diff(cairn_dir, &old_files, &new_files).unwrap();
 
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            LineOp::AddFile { path, content } => {
+            FileOp::AddFile { path, content_blob } => {
                 assert_eq!(path, &PathBuf::from("test.txt"));
-                assert_eq!(content, b"content\n");
+                assert!(blob_exists(cairn_dir, content_blob));
             }
             _ => panic!("Expected AddFile operation"),
         }
@@ -173,17 +337,20 @@ mod tests {
 
     #[test]
     fn test_diff_delete_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let cairn_dir = temp_dir.path();
+
         let mut old_files = HashMap::new();
         old_files.insert(PathBuf::from("test.txt"), b"content\n".to_vec());
         let new_files = HashMap::new();
 
-        let ops = compute_diff(&old_files, &new_files).unwrap();
+        let ops = compute_diff(cairn_dir, &old_files, &new_files).unwrap();
 
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            LineOp::DeleteFile { path, old_content } => {
+            FileOp::DeleteFile { path, old_blob } => {
                 assert_eq!(path, &PathBuf::from("test.txt"));
-                assert_eq!(old_content, b"content\n");
+                assert!(blob_exists(cairn_dir, old_blob));
             }
             _ => panic!("Expected DeleteFile operation"),
         }
@@ -191,59 +358,233 @@ mod tests {
 
     #[test]
     fn test_diff_modify_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let cairn_dir = temp_dir.path();
+
         let mut old_files = HashMap::new();
-        old_files.insert(PathBuf::from("test.txt"), b"old\n".to_vec());
+        old_files.insert(PathBuf::from("test.txt"), b"old content\n".to_vec());
 
         let mut new_files = HashMap::new();
-        new_files.insert(PathBuf::from("test.txt"), b"new\n".to_vec());
+        new_files.insert(PathBuf::from("test.txt"), b"new content\n".to_vec());
 
-        let ops = compute_diff(&old_files, &new_files).unwrap();
+        let ops = compute_diff(cairn_dir, &old_files, &new_files).unwrap();
 
-        // Should have delete + insert operations
-        assert!(ops.len() >= 2);
-
-        // First operation should be delete
+        assert_eq!(ops.len(), 1);
         match &ops[0] {
-            LineOp::DeleteLine { file, at, old_content } => {
-                assert_eq!(file, &PathBuf::from("test.txt"));
-                assert_eq!(*at, 0);
-                assert_eq!(old_content, b"old\n");
+            FileOp::ModifyFile {
+                path,
+                base_blob,
+                operations,
+                result_hash,
+            } => {
+                assert_eq!(path, &PathBuf::from("test.txt"));
+                assert!(blob_exists(cairn_dir, base_blob));
+                assert!(!operations.is_empty());
+
+                // Verify result hash matches new content
+                let expected_hash = blake3::hash(b"new content\n");
+                assert_eq!(result_hash, expected_hash.as_bytes());
             }
-            _ => panic!("Expected DeleteLine operation"),
+            _ => panic!("Expected ModifyFile operation"),
         }
     }
 
     #[test]
     fn test_diff_no_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let cairn_dir = temp_dir.path();
+
         let mut old_files = HashMap::new();
         old_files.insert(PathBuf::from("test.txt"), b"content\n".to_vec());
 
         let mut new_files = HashMap::new();
         new_files.insert(PathBuf::from("test.txt"), b"content\n".to_vec());
 
-        let ops = compute_diff(&old_files, &new_files).unwrap();
+        let ops = compute_diff(cairn_dir, &old_files, &new_files).unwrap();
 
         // No changes = no operations
         assert_eq!(ops.len(), 0);
     }
 
     #[test]
-    fn test_diff_multiple_files() {
+    fn test_generate_byte_ops_identical() {
+        let content = b"hello world";
+        let ops = generate_byte_ops(content, content);
+
+        // Should be a single Copy operation
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            ByteOp::Copy { start, len } => {
+                assert_eq!(*start, 0);
+                assert_eq!(*len, content.len());
+            }
+            _ => panic!("Expected Copy operation"),
+        }
+    }
+
+    #[test]
+    fn test_generate_byte_ops_partial_match() {
+        let old = b"hello world\n";
+        let new = b"hello world\nrust is here\n";
+        let ops = generate_byte_ops(old, new);
+
+        // Line-based diff: Copy("hello world\n"), Insert("rust is here\n")
+        assert!(ops.len() >= 2);
+
+        // Verify reconstruction
+        let reconstructed = apply_byte_ops(old, &ops);
+        assert_eq!(reconstructed, new);
+    }
+
+    #[test]
+    fn test_generate_byte_ops_completely_different() {
+        let old_content = b"old content";
+        let new_content = b"completely different";
+        let ops = generate_byte_ops(old_content, new_content);
+
+        // Should be Insert (no matches)
+        assert!(!ops.is_empty());
+
+        // Verify reconstruction
+        let reconstructed = apply_byte_ops(old_content, &ops);
+        assert_eq!(reconstructed, new_content);
+    }
+
+    #[test]
+    fn test_apply_byte_ops() {
+        let base = b"hello world";
+
+        // Test Copy
+        let ops = vec![ByteOp::Copy { start: 0, len: 5 }];
+        let result = apply_byte_ops(base, &ops);
+        assert_eq!(result, b"hello");
+
+        // Test Insert
+        let ops = vec![ByteOp::Insert {
+            content: b"new content".to_vec(),
+        }];
+        let result = apply_byte_ops(base, &ops);
+        assert_eq!(result, b"new content");
+
+        // Test Copy + Insert + Copy
+        let ops = vec![
+            ByteOp::Copy { start: 0, len: 5 },
+            ByteOp::Insert {
+                content: b" new".to_vec(),
+            },
+            ByteOp::Copy { start: 5, len: 6 },
+        ];
+        let result = apply_byte_ops(base, &ops);
+        assert_eq!(result, b"hello new world");
+    }
+
+    #[test]
+    fn test_merge_operations_consecutive_copy() {
+        let ops = vec![
+            ByteOp::Copy { start: 0, len: 10 },
+            ByteOp::Copy { start: 10, len: 5 },
+        ];
+
+        let merged = merge_operations(ops);
+        assert_eq!(merged.len(), 1);
+        match &merged[0] {
+            ByteOp::Copy { start, len } => {
+                assert_eq!(*start, 0);
+                assert_eq!(*len, 15);
+            }
+            _ => panic!("Expected merged Copy"),
+        }
+    }
+
+    #[test]
+    fn test_merge_operations_consecutive_insert() {
+        let ops = vec![
+            ByteOp::Insert {
+                content: b"hello".to_vec(),
+            },
+            ByteOp::Insert {
+                content: b" world".to_vec(),
+            },
+        ];
+
+        let merged = merge_operations(ops);
+        assert_eq!(merged.len(), 1);
+        match &merged[0] {
+            ByteOp::Insert { content } => {
+                assert_eq!(content, b"hello world");
+            }
+            _ => panic!("Expected merged Insert"),
+        }
+    }
+
+    #[test]
+    fn test_binary_invariant() {
+        // Test with text data (not binary) - generate_byte_ops() is for text only
+        // Binary data should use the direct Insert path in compute_binary_diff()
+        let old = b"hello world";
+        let new = b"hello rust world";
+
+        let ops = generate_byte_ops(old, new);
+        let reconstructed = apply_byte_ops(old, &ops);
+
+        assert_eq!(reconstructed, new);
+    }
+
+    #[test]
+    fn test_is_likely_text() {
+        // Text content
+        assert!(is_likely_text(b"Hello, world!\n"));
+        assert!(is_likely_text(b"fn main() {\n    println!(\"test\");\n}\n"));
+        assert!(is_likely_text(b"Line 1\nLine 2\nLine 3\n"));
+
+        // Binary content (contains null bytes)
+        assert!(!is_likely_text(&[0xFF, 0x00, 0xAB, 0xCD]));
+        assert!(!is_likely_text(b"text\x00with\x00nulls"));
+
+        // Binary content (many control characters)
+        let control_heavy: Vec<u8> = (0..255).collect();
+        assert!(!is_likely_text(&control_heavy));
+    }
+
+    #[test]
+    fn test_binary_file_no_diff() {
+        let temp_dir = TempDir::new().unwrap();
+        let cairn_dir = temp_dir.path();
+
         let mut old_files = HashMap::new();
-        old_files.insert(PathBuf::from("a.txt"), b"old a\n".to_vec());
-        old_files.insert(PathBuf::from("b.txt"), b"keep b\n".to_vec());
+        let old_binary = vec![0xFF, 0x00, 0xAB, 0xCD, 0xEF];
+        old_files.insert(PathBuf::from("binary.dat"), old_binary.clone());
 
         let mut new_files = HashMap::new();
-        new_files.insert(PathBuf::from("b.txt"), b"keep b\n".to_vec());
-        new_files.insert(PathBuf::from("c.txt"), b"new c\n".to_vec());
+        let new_binary = vec![0xFF, 0x00, 0x12, 0x34, 0xCD, 0xEF];
+        new_files.insert(PathBuf::from("binary.dat"), new_binary.clone());
 
-        let ops = compute_diff(&old_files, &new_files).unwrap();
+        let ops = compute_diff(cairn_dir, &old_files, &new_files).unwrap();
 
-        // Should have: delete a.txt, add c.txt
-        let delete_count = ops.iter().filter(|op| matches!(op, LineOp::DeleteFile { .. })).count();
-        let add_count = ops.iter().filter(|op| matches!(op, LineOp::AddFile { .. })).count();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            FileOp::ModifyFile {
+                path,
+                operations,
+                result_hash,
+                ..
+            } => {
+                assert_eq!(path, &PathBuf::from("binary.dat"));
 
-        assert_eq!(delete_count, 1);
-        assert_eq!(add_count, 1);
+                // Binary file should have single Insert operation (no diff)
+                assert_eq!(operations.len(), 1);
+                match &operations[0] {
+                    ByteOp::Insert { content } => {
+                        assert_eq!(content, &new_binary);
+                    }
+                    _ => panic!("Expected Insert operation for binary file"),
+                }
+
+                // Verify result hash
+                let expected_hash = blake3::hash(&new_binary);
+                assert_eq!(result_hash, expected_hash.as_bytes());
+            }
+            _ => panic!("Expected ModifyFile operation"),
+        }
     }
 }

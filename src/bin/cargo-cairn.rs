@@ -117,7 +117,7 @@ fn create_pending_snapshot() -> Result<bool> {
     let previous_files = cairn::snapshot::get_previous_files(&state, &cairn_dir)?;
 
     // Compute diff
-    let operations = cairn::diff::compute_diff(&previous_files, &current_files)
+    let operations = cairn::diff::compute_diff(&cairn_dir, &previous_files, &current_files)
         .context("Failed to compute diff")?;
 
     if operations.is_empty() {
@@ -184,6 +184,7 @@ fn auto_init(cairn_dir: &PathBuf) -> Result<()> {
     // Create .cairn directory structure
     fs::create_dir(cairn_dir).context("Failed to create .cairn directory")?;
     fs::create_dir(cairn_dir.join("patches")).context("Failed to create patches directory")?;
+    fs::create_dir(cairn_dir.join("blobs")).context("Failed to create blobs directory")?;
 
     // Create initial empty state
     let initial_state = cairn::state::RepositoryState::new();

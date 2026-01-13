@@ -3,7 +3,7 @@
   "displayName": "Cairn",
   "description": "Patch-based version control for successful cargo builds",
   "version": "0.0.0",
-  "publisher": "nickspiker",
+  "publisher": "fractaldecoder",
   "icon": "resources/cairn-icon.png",
   "engines": {
     "vscode": "^1.85.0"
@@ -12,7 +12,9 @@
     "SCM Providers",
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "*"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "configuration": {
@@ -21,12 +23,41 @@
         "cairn.buildCommands": {
           "type": "array",
           "default": [
-            {"label": "Build", "command": "build", "icon": "tools"},
-            {"label": "Build (Release)", "command": "build --release", "icon": "rocket"},
-            {"label": "Check", "command": "check", "icon": "check"},
-            {"label": "Test", "command": "test", "icon": "beaker"},
-            {"label": "Run", "command": "run", "icon": "run"},
-            {"label": "Clean", "command": "clean", "icon": "trash"}
+            {
+              "label": "Run",
+              "command": "run",
+              "icon": "run"
+            },
+            {
+              "label": "Run (Release)",
+              "command": "run --release",
+              "icon": "rocket"
+            },
+            {
+              "label": "Build",
+              "command": "build",
+              "icon": "tools"
+            },
+            {
+              "label": "Build (Release)",
+              "command": "build --release",
+              "icon": "package"
+            },
+            {
+              "label": "Check",
+              "command": "check",
+              "icon": "check"
+            },
+            {
+              "label": "Test",
+              "command": "test",
+              "icon": "beaker"
+            },
+            {
+              "label": "Clean",
+              "command": "clean",
+              "icon": "trash"
+            }
           ],
           "description": "Cargo commands to show as buttons in the Cairn panel"
         }
@@ -62,11 +93,11 @@
       "explorer": [
         {
           "id": "cairnHistory",
-          "name": "Cairn Patch History"
+          "name": "Cairn Patch History (v0.0.0)"
         },
         {
           "id": "cairnBuildCommands",
-          "name": "Cairn Build Commands"
+          "name": "Cairn Build Commands (v0.0.0)"
         }
       ]
     },
@@ -99,5 +130,8 @@
     "@typescript-eslint/parser": "^6.x",
     "eslint": "^8.x",
     "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.0.1"
   }
 }

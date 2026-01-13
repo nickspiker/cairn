@@ -1,7 +1,9 @@
+//! VSF decoding for cairn patches with binary diff and blob storage
 //!
 //! Parses VSF-encoded patches back into Rust structures.
+//! Decodes FileOp with ByteOp from byte vectors.
 
-use crate::patch::{LineOp, Patch, PatchId, PatchMetadata};
+use crate::patch::{ByteOp, FileOp, Patch, PatchId, PatchMetadata};
 use anyhow::{anyhow, Result};
 use vsf::{VsfHeader, VsfSection, VsfType};
 
@@ -71,14 +73,14 @@ impl Patch {
 /// Decode metadata section
 fn decode_metadata_section(
     section: &VsfSection,
-    header: &VsfHeader,
+    _header: &VsfHeader,
 ) -> Result<PatchMetadata> {
     let author = extract_hash(section, "author")?;
     let parent = extract_hash_opt(section, "parent");
     let message = extract_string(section, "message")?;
 
-    // Extract timestamp from header creation time
-    let timestamp = extract_eagle_time(&header.creation_time)?;
+    // Extract timestamp from metadata section (not header)
+    let timestamp = extract_timestamp(section, "timestamp")?;
 
     Ok(PatchMetadata {
         author,
@@ -88,8 +90,8 @@ fn decode_metadata_section(
     })
 }
 
-/// Decode operations section
-fn decode_operations_section(section: &VsfSection) -> Result<Vec<LineOp>> {
+/// Decode operations section with FileOp and ByteOp
+fn decode_operations_section(section: &VsfSection) -> Result<Vec<FileOp>> {
     let mut ops = Vec::new();
 
     for field in section.get_fields("op") {
@@ -101,65 +103,52 @@ fn decode_operations_section(section: &VsfSection) -> Result<Vec<LineOp>> {
 
         let op = match op_type {
             0 => {
-                // InsertLine: [op_type, file, after, content]
-                if field.values.len() < 4 {
-                    return Err(anyhow!("InsertLine operation missing values"));
+                // ModifyFile: [op_type, path, base_blob, result_hash, byte_ops_encoded]
+                if field.values.len() < 5 {
+                    return Err(anyhow!("ModifyFile operation missing values"));
                 }
-                LineOp::InsertLine {
-                    file: extract_pathbuf_from_value(&field.values[1])?,
-                    after: extract_usize_from_value(&field.values[2])?,
-                    content: extract_bytes_from_value(&field.values[3])?,
+
+                let path = extract_pathbuf_from_value(&field.values[1])?;
+                let base_blob = extract_hash_from_value(&field.values[2])?;
+                let result_hash = extract_hash_from_value(&field.values[3])?;
+                let byte_ops_encoded = extract_bytes_from_value(&field.values[4])?;
+
+                // Decode ByteOp operations
+                let operations = decode_byte_ops(&byte_ops_encoded)?;
+
+                FileOp::ModifyFile {
+                    path,
+                    base_blob,
+                    operations,
+                    result_hash,
                 }
             }
             1 => {
-                // DeleteLine: [op_type, file, at, old_content]
-                if field.values.len() < 4 {
-                    return Err(anyhow!("DeleteLine operation missing values"));
-                }
-                LineOp::DeleteLine {
-                    file: extract_pathbuf_from_value(&field.values[1])?,
-                    at: extract_usize_from_value(&field.values[2])?,
-                    old_content: extract_bytes_from_value(&field.values[3])?,
-                }
-            }
-            2 => {
-                // ModifyLine: [op_type, file, at, old, new]
-                if field.values.len() < 5 {
-                    return Err(anyhow!("ModifyLine operation missing values"));
-                }
-                LineOp::ModifyLine {
-                    file: extract_pathbuf_from_value(&field.values[1])?,
-                    at: extract_usize_from_value(&field.values[2])?,
-                    old: extract_bytes_from_value(&field.values[3])?,
-                    new: extract_bytes_from_value(&field.values[4])?,
-                }
-            }
-            3 => {
-                // AddFile: [op_type, path, content]
+                // AddFile: [op_type, path, content_blob]
                 if field.values.len() < 3 {
                     return Err(anyhow!("AddFile operation missing values"));
                 }
-                LineOp::AddFile {
+                FileOp::AddFile {
                     path: extract_pathbuf_from_value(&field.values[1])?,
-                    content: extract_bytes_from_value(&field.values[2])?,
+                    content_blob: extract_hash_from_value(&field.values[2])?,
                 }
             }
-            4 => {
-                // DeleteFile: [op_type, path, old_content]
+            2 => {
+                // DeleteFile: [op_type, path, old_blob]
                 if field.values.len() < 3 {
                     return Err(anyhow!("DeleteFile operation missing values"));
                 }
-                LineOp::DeleteFile {
+                FileOp::DeleteFile {
                     path: extract_pathbuf_from_value(&field.values[1])?,
-                    old_content: extract_bytes_from_value(&field.values[2])?,
+                    old_blob: extract_hash_from_value(&field.values[2])?,
                 }
             }
-            5 => {
+            3 => {
                 // RenameFile: [op_type, from, to]
                 if field.values.len() < 3 {
                     return Err(anyhow!("RenameFile operation missing values"));
                 }
-                LineOp::RenameFile {
+                FileOp::RenameFile {
                     from: extract_pathbuf_from_value(&field.values[1])?,
                     to: extract_pathbuf_from_value(&field.values[2])?,
                 }
@@ -173,10 +162,82 @@ fn decode_operations_section(section: &VsfSection) -> Result<Vec<LineOp>> {
     Ok(ops)
 }
 
+/// Decode ByteOp operations from a byte vector
+///
+/// Format for each operation:
+/// - Copy: [0u8, start_bytes..., len_bytes...]
+/// - Insert: [1u8, len_bytes..., content_bytes...]
+///
+/// Uses variable-length encoding for sizes (LEB128-style).
+fn decode_byte_ops(encoded: &[u8]) -> Result<Vec<ByteOp>> {
+    let mut ops = Vec::new();
+    let mut pos = 0;
+
+    while pos < encoded.len() {
+        let op_tag = encoded[pos];
+        pos += 1;
+
+        match op_tag {
+            0 => {
+                // Copy operation
+                let (start, bytes_read) = decode_varint(&encoded[pos..])?;
+                pos += bytes_read;
+
+                let (len, bytes_read) = decode_varint(&encoded[pos..])?;
+                pos += bytes_read;
+
+                ops.push(ByteOp::Copy { start, len });
+            }
+            1 => {
+                // Insert operation
+                let (content_len, bytes_read) = decode_varint(&encoded[pos..])?;
+                pos += bytes_read;
+
+                if pos + content_len > encoded.len() {
+                    return Err(anyhow!("Insert content extends beyond buffer"));
+                }
+
+                let content = encoded[pos..pos + content_len].to_vec();
+                pos += content_len;
+
+                ops.push(ByteOp::Insert { content });
+            }
+            _ => return Err(anyhow!("Unknown ByteOp tag: {}", op_tag)),
+        }
+    }
+
+    Ok(ops)
+}
+
+/// Decode variable-length integer (LEB128)
+fn decode_varint(buf: &[u8]) -> Result<(usize, usize)> {
+    let mut result = 0usize;
+    let mut shift = 0;
+    let mut bytes_read = 0;
+
+    for &byte in buf {
+        bytes_read += 1;
+
+        result |= ((byte & 0x7F) as usize) << shift;
+
+        if byte & 0x80 == 0 {
+            // Last byte
+            return Ok((result, bytes_read));
+        }
+
+        shift += 7;
+
+        if shift >= 64 {
+            return Err(anyhow!("Varint too large"));
+        }
+    }
+
+    Err(anyhow!("Incomplete varint"))
+}
+
 /// Decode build output section
-fn decode_build_section(section: &VsfSection) -> Result<blake3::Hash> {
-    let hash_bytes = extract_hash(section, "cargo_hash")?;
-    Ok(blake3::Hash::from_bytes(hash_bytes))
+fn decode_build_section(section: &VsfSection) -> Result<[u8; 32]> {
+    extract_hash(section, "cargo_hash")
 }
 
 // ==================== Helper Functions ====================
@@ -303,6 +364,38 @@ fn extract_eagle_time(value: &VsfType) -> Result<f64> {
     }
 }
 
+/// Extract timestamp (Eagle Time) from a field
+fn extract_timestamp(section: &VsfSection, field_name: &str) -> Result<f64> {
+    let field = section
+        .get_field(field_name)
+        .ok_or_else(|| anyhow!("Missing field: {}", field_name))?;
+
+    if field.values.is_empty() {
+        return Err(anyhow!("Field '{}' has no values", field_name));
+    }
+
+    extract_eagle_time(&field.values[0])
+}
+
+/// Extract a hash from a VsfType value (for inline hash extraction)
+fn extract_hash_from_value(value: &VsfType) -> Result<[u8; 32]> {
+    match value {
+        VsfType::hp(bytes) | VsfType::hb(bytes) | VsfType::hs(bytes) | VsfType::hm(bytes) | VsfType::hg(bytes) | VsfType::hc(bytes) | VsfType::hk(bytes) => {
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(bytes);
+                Ok(arr)
+            } else {
+                Err(anyhow!(
+                    "Invalid hash length: {} (expected 32)",
+                    bytes.len()
+                ))
+            }
+        }
+        _ => Err(anyhow!("Not a hash type")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,7 +405,11 @@ mod tests {
     #[test]
     fn test_roundtrip_patch() {
         let author = get_author_id();
-        let build_hash = blake3::hash(b"test build output");
+        let build_hash = *blake3::hash(b"test build output").as_bytes();
+        let content_blob = *blake3::hash(b"file content").as_bytes();
+        let base_blob = *blake3::hash(b"base content").as_bytes();
+        let result_hash = *blake3::hash(b"result content").as_bytes();
+        let old_blob = *blake3::hash(b"old content").as_bytes();
 
         let original = Patch::new(
             author,
@@ -320,21 +417,28 @@ mod tests {
             1234567890.0,
             "Test patch message".to_string(),
             vec![
-                LineOp::InsertLine {
-                    file: PathBuf::from("src/main.rs"),
-                    after: 0,
-                    content: b"fn main() {".to_vec(),
+                FileOp::AddFile {
+                    path: PathBuf::from("src/new.rs"),
+                    content_blob,
                 },
-                LineOp::DeleteLine {
-                    file: PathBuf::from("src/main.rs"),
-                    at: 5,
-                    old_content: b"old line".to_vec(),
+                FileOp::ModifyFile {
+                    path: PathBuf::from("src/main.rs"),
+                    base_blob,
+                    operations: vec![
+                        ByteOp::Copy { start: 0, len: 10 },
+                        ByteOp::Insert {
+                            content: b"new code".to_vec(),
+                        },
+                    ],
+                    result_hash,
                 },
-                LineOp::ModifyLine {
-                    file: PathBuf::from("src/lib.rs"),
-                    at: 10,
-                    old: b"old content".to_vec(),
-                    new: b"new content".to_vec(),
+                FileOp::DeleteFile {
+                    path: PathBuf::from("src/old.rs"),
+                    old_blob,
+                },
+                FileOp::RenameFile {
+                    from: PathBuf::from("old.txt"),
+                    to: PathBuf::from("new.txt"),
                 },
             ],
             build_hash,
@@ -368,7 +472,7 @@ mod tests {
     fn test_decode_with_parent() {
         let author = get_author_id();
         let parent = *blake3::hash(b"parent patch").as_bytes();
-        let build_hash = blake3::hash(b"build");
+        let build_hash = *blake3::hash(b"build").as_bytes();
 
         let original = Patch::new(
             author,
@@ -384,5 +488,41 @@ mod tests {
 
         assert_eq!(decoded.metadata.parent, Some(parent));
     }
+
+    #[test]
+    fn test_byte_ops_roundtrip() {
+        use crate::encode::encode_byte_ops;
+
+        let original_ops = vec![
+            ByteOp::Copy { start: 0, len: 100 },
+            ByteOp::Insert {
+                content: b"hello world".to_vec(),
+            },
+            ByteOp::Copy {
+                start: 200,
+                len: 50,
+            },
+        ];
+
+        let encoded = encode_byte_ops(&original_ops);
+        let decoded = decode_byte_ops(&encoded).unwrap();
+
+        assert_eq!(original_ops, decoded);
+    }
+
+    #[test]
+    fn test_varint_roundtrip() {
+        use crate::encode::encode_varint;
+
+        let test_values = vec![0, 1, 127, 128, 255, 256, 16383, 16384, 1000000];
+
+        for value in test_values {
+            let mut buf = Vec::new();
+            encode_varint(&mut buf, value);
+
+            let (decoded, bytes_read) = decode_varint(&buf).unwrap();
+            assert_eq!(decoded, value);
+            assert_eq!(bytes_read, buf.len());
+        }
+    }
 }
-//! VSF decoding for cairn patches

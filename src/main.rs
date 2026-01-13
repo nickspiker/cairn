@@ -7,6 +7,7 @@
 //! - Easy rollback to any successful build state
 
 mod apply;
+mod blob;
 mod decode;
 mod diff;
 mod encode;
@@ -89,12 +90,31 @@ fn cmd_init() -> Result<()> {
 
     // Check if already initialized
     if cairn_dir.exists() {
-        return Err(anyhow!("Cairn already initialized in this directory"));
+        eprintln!("WARNING: .cairn/ directory already exists!");
+        eprintln!("This will DELETE all existing patches and start over.");
+        eprintln!("");
+        eprint!("Are you sure you want to continue? (y/N): ");
+
+        use std::io::{self, Write};
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        let response = input.trim().to_lowercase();
+        if response != "y" && response != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
+
+        println!("Removing existing .cairn/ directory...");
+        fs::remove_dir_all(&cairn_dir).context("Failed to remove existing .cairn directory")?;
     }
 
     // Create .cairn directory structure
     fs::create_dir(&cairn_dir).context("Failed to create .cairn directory")?;
     fs::create_dir(cairn_dir.join("patches")).context("Failed to create patches directory")?;
+    fs::create_dir(cairn_dir.join("blobs")).context("Failed to create blobs directory")?;
 
     // Create initial empty state
     let initial_state = state::RepositoryState::new();
@@ -233,7 +253,7 @@ fn cmd_rollback(patch_id: &str) -> Result<()> {
         let patch_bytes = fs::read(&patch_path)?;
         let patch = patch::Patch::decode_vsf(&patch_bytes)?;
 
-        current_files = apply::apply_operations(&current_files, &patch.operations)?;
+        current_files = apply::apply_operations(&cairn_dir, &current_files, &patch.operations)?;
     }
 
     // Write files to working directory
