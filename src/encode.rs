@@ -50,8 +50,8 @@ fn encode_metadata_section(metadata: &crate::patch::PatchMetadata) -> Result<Vsf
         section.add_field("parent", VsfType::hp(parent.to_vec()));
     }
 
-    // Timestamp (Eagle Time - seconds since 1969-07-20 20:17:40 UTC)
-    section.add_field("timestamp", VsfType::e(vsf::EtType::f6(metadata.timestamp)));
+    // Timestamp (Eagle Time - oscillation count since 1969-07-20 20:17:40 UTC)
+    section.add_field("timestamp", VsfType::e(vsf::EtType::u(metadata.timestamp)));
 
     // Commit message (Huffman compressed)
     section.add_field("message", VsfType::x(metadata.message.clone()));
@@ -188,7 +188,7 @@ mod tests {
         let metadata = PatchMetadata {
             author: get_author_id(),
             parent: None,
-            timestamp: 1234567890.0,
+            timestamp: 1234567890,
             message: "Test patch".to_string(),
         };
 
@@ -272,7 +272,7 @@ mod tests {
         let patch = Patch::new(
             author,
             None,
-            1234567890.0,
+            1234567890,
             "Test patch".to_string(),
             vec![FileOp::AddFile {
                 path: PathBuf::from("src/main.rs"),
@@ -341,7 +341,7 @@ mod tests {
         let patch = Patch::new(
             author,
             None,
-            1234567890.0,
+            1234567890,
             "Test patch".to_string(),
             vec![FileOp::AddFile {
                 path: PathBuf::from("src/main.rs"),

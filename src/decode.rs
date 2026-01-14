@@ -352,20 +352,19 @@ fn extract_pathbuf_from_value(value: &VsfType) -> Result<std::path::PathBuf> {
 }
 
 /// Extract Eagle Time (f64) from a VsfType
-fn extract_eagle_time(value: &VsfType) -> Result<f64> {
+fn extract_eagle_time(value: &VsfType) -> Result<usize> {
     match value {
         VsfType::e(et_type) => match et_type {
-            vsf::EtType::f5(f) => Ok(*f as f64),
-            vsf::EtType::f6(f) => Ok(*f),
-            vsf::EtType::u(u) => Ok(*u as f64),
-            _ => Err(anyhow!("Unsupported Eagle Time format")),
+            vsf::EtType::u(u) => Ok(*u),
+            vsf::EtType::i(i) => Ok(*i as usize),
+            _ => Err(anyhow!("Eagle Time must be stored as oscillation count (u/i type)")),
         },
         _ => Err(anyhow!("Not an Eagle Time type")),
     }
 }
 
-/// Extract timestamp (Eagle Time) from a field
-fn extract_timestamp(section: &VsfSection, field_name: &str) -> Result<f64> {
+/// Extract timestamp (Eagle Time oscillation count) from a field
+fn extract_timestamp(section: &VsfSection, field_name: &str) -> Result<usize> {
     let field = section
         .get_field(field_name)
         .ok_or_else(|| anyhow!("Missing field: {}", field_name))?;
@@ -414,7 +413,7 @@ mod tests {
         let original = Patch::new(
             author,
             None,
-            1234567890.0,
+            1234567890,
             "Test patch message".to_string(),
             vec![
                 FileOp::AddFile {

@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use blake3::Hash;
 use std::collections::HashMap;
 use std::fs;
+use vsf::types::eagle_time;
 use std::path::PathBuf;
 use vsf::verification::compute_provenance_hash;
 
@@ -43,8 +44,8 @@ pub fn create_snapshot_from_files(
         return Ok(repo_state.head.clone());
     }
 
-    // Create patch
-    let timestamp = chrono::Utc::now().timestamp() as f64;
+    // Create patch - get current Eagle Time as oscillation count
+    let timestamp = eagle_time::eagle_time_oscillations();
     let parent = if repo_state.is_empty() {
         None
     } else {

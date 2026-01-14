@@ -20,8 +20,8 @@ pub struct PatchMetadata {
     /// Parent patch ID (None for initial patch)
     pub parent: Option<PatchId>,
 
-    /// Creation timestamp (Eagle Time - seconds since 1969-07-20 20:17:40 UTC)
-    pub timestamp: f64,
+    /// Creation timestamp (Eagle Time - oscillation count since 1969-07-20 20:17:40 UTC)
+    pub timestamp: usize,
 
     /// Patch message
     pub message: String,
@@ -106,7 +106,7 @@ impl Patch {
     pub fn new(
         author: AuthorId,
         parent: Option<PatchId>,
-        timestamp: f64,
+        timestamp: usize,
         message: String,
         operations: Vec<FileOp>,
         build_hash: [u8; 32],
