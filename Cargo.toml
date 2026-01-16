@@ -10,6 +10,13 @@ repository = "https://github.com/nickspiker/cairn"
 license = "MIT OR Apache-2.0"
 keywords = ["version-control", "build", "snapshot", "vcs", "cargo"]
 categories = ["development-tools", "command-line-utilities"]
+exclude = [
+    "vscode-extension/",
+    ".cairn/",
+    "examples/",
+    "release-v0.0.0/",
+    "resources/",
+]
 
 [lib]
 name = "cairn"
