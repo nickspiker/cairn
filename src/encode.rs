@@ -1,4 +1,4 @@
-//! VSF encoding for cairn patches with binary diff and blob storage
+//! VSF encoding for cairn patches with binary diffs on x-encoded snapshots
 //!
 //! Encodes patches using VSF's hierarchical section format:
 //! - metadata section: author, parent, timestamp, message
@@ -6,8 +6,7 @@
 //! - build_output section: cargo build hash
 //!
 //! Hash types used:
-//! - hp (hash provenance): Content identification for blobs (immutable, identifies specific content)
-//! - hb (hash rolling/integrity): Integrity verification for patch results (verifies correct application)
+//! - hp (hash provenance): Content identification for snapshots and results (immutable, identifies specific content)
 
 use crate::patch::{ByteOp, FileOp, Patch};
 use anyhow::Result;
@@ -51,7 +50,7 @@ fn encode_metadata_section(metadata: &crate::patch::PatchMetadata) -> Result<Vsf
     }
 
     // Timestamp (Eagle Time - oscillation count since 1969-07-20 20:17:40 UTC)
-    section.add_field("timestamp", VsfType::e(vsf::EtType::u(metadata.timestamp)));
+    section.add_field("timestamp", VsfType::e(vsf::EtType::u(metadata.timestamp as u64)));
 
     // Commit message (Huffman compressed)
     section.add_field("message", VsfType::x(metadata.message.clone()));
@@ -67,7 +66,7 @@ fn encode_operations_section(operations: &[FileOp]) -> Result<VsfSection> {
         match op {
             FileOp::ModifyFile {
                 path,
-                base_blob,
+                base_snapshot,
                 operations: byte_ops,
                 result_hash,
             } => {
@@ -77,33 +76,34 @@ fn encode_operations_section(operations: &[FileOp]) -> Result<VsfSection> {
                 section.add_field_multi(
                     "op",
                     vec![
-                        VsfType::u3(0),                                     // Op type: 0=modify file
-                        VsfType::l(path.to_string_lossy().to_string()),     // File path
-                        VsfType::hp(base_blob.to_vec()),                    // Base blob hash (provenance)
-                        VsfType::hb(result_hash.to_vec()),                  // Result hash (integrity)
-                        VsfType::v_u3(Vector { data: byte_ops_encoded }),   // ByteOp sequence
+                        VsfType::u3(0),                                 // Op type: 0=modify file
+                        VsfType::l(path.to_string_lossy().to_string()), // File path
+                        VsfType::hp(base_snapshot.to_vec()), // Base snapshot hash (provenance)
+                        VsfType::hp(result_hash.to_vec()), // Result hash (provenance of x-encoded result)
+                        VsfType::v_u3(Vector {
+                            data: byte_ops_encoded,
+                        }), // ByteOp sequence (on x-encoded content)
                     ],
                 );
             }
 
-            FileOp::AddFile { path, content_blob } => {
+            FileOp::AddFile { path } => {
                 section.add_field_multi(
                     "op",
                     vec![
-                        VsfType::u3(1),                                     // Op type: 1=add file
-                        VsfType::l(path.to_string_lossy().to_string()),     // File path
-                        VsfType::hp(content_blob.to_vec()),                 // Content blob hash (provenance)
+                        VsfType::u3(1),                                 // Op type: 1=add file
+                        VsfType::l(path.to_string_lossy().to_string()), // File path (content in new snapshot)
                     ],
                 );
             }
 
-            FileOp::DeleteFile { path, old_blob } => {
+            FileOp::DeleteFile { path, old_snapshot } => {
                 section.add_field_multi(
                     "op",
                     vec![
-                        VsfType::u3(2),                                     // Op type: 2=delete file
-                        VsfType::l(path.to_string_lossy().to_string()),     // File path
-                        VsfType::hp(old_blob.to_vec()),                     // Old blob hash (provenance)
+                        VsfType::u3(2),                                 // Op type: 2=delete file
+                        VsfType::l(path.to_string_lossy().to_string()), // File path
+                        VsfType::hp(old_snapshot.to_vec()), // Old snapshot hash (provenance)
                     ],
                 );
             }
@@ -112,9 +112,9 @@ fn encode_operations_section(operations: &[FileOp]) -> Result<VsfSection> {
                 section.add_field_multi(
                     "op",
                     vec![
-                        VsfType::u3(3),                                     // Op type: 3=rename file
-                        VsfType::l(from.to_string_lossy().to_string()),     // Source path
-                        VsfType::l(to.to_string_lossy().to_string()),       // Dest path
+                        VsfType::u3(3),                                 // Op type: 3=rename file
+                        VsfType::l(from.to_string_lossy().to_string()), // Source path
+                        VsfType::l(to.to_string_lossy().to_string()),   // Dest path
                     ],
                 );
             }
@@ -180,7 +180,7 @@ fn encode_build_section(build_hash: &[u8; 32]) -> Result<VsfSection> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patch::{get_author_id, PatchMetadata};
+    use crate::patch::{PatchMetadata, get_author_id};
     use std::path::PathBuf;
 
     #[test]
@@ -221,25 +221,23 @@ mod tests {
 
     #[test]
     fn test_encode_operations() {
-        let content_blob = *blake3::hash(b"file content").as_bytes();
-        let base_blob = *blake3::hash(b"base content").as_bytes();
-        let result_hash = *blake3::hash(b"result content").as_bytes();
-        let old_blob = *blake3::hash(b"old content").as_bytes();
+        let base_snapshot = *blake3::hash(b"base snapshot").as_bytes();
+        let result_hash = *blake3::hash(b"result x-encoded content").as_bytes();
+        let old_snapshot = *blake3::hash(b"old snapshot").as_bytes();
 
         let ops = vec![
             FileOp::AddFile {
                 path: PathBuf::from("src/main.rs"),
-                content_blob,
             },
             FileOp::ModifyFile {
                 path: PathBuf::from("src/lib.rs"),
-                base_blob,
+                base_snapshot,
                 operations: vec![ByteOp::Copy { start: 0, len: 10 }],
                 result_hash,
             },
             FileOp::DeleteFile {
                 path: PathBuf::from("old.rs"),
-                old_blob,
+                old_snapshot,
             },
             FileOp::RenameFile {
                 from: PathBuf::from("old.txt"),
@@ -267,7 +265,6 @@ mod tests {
     fn test_full_patch_encode() {
         let author = get_author_id();
         let build_hash = *blake3::hash(b"test build").as_bytes();
-        let content_blob = *blake3::hash(b"test content").as_bytes();
 
         let patch = Patch::new(
             author,
@@ -276,7 +273,6 @@ mod tests {
             "Test patch".to_string(),
             vec![FileOp::AddFile {
                 path: PathBuf::from("src/main.rs"),
-                content_blob,
             }],
             build_hash,
         );
@@ -336,7 +332,6 @@ mod tests {
 
         let author = get_author_id();
         let build_hash = *blake3::hash(b"test build").as_bytes();
-        let content_blob = *blake3::hash(b"fn main() {}").as_bytes();
 
         let patch = Patch::new(
             author,
@@ -345,7 +340,6 @@ mod tests {
             "Test patch".to_string(),
             vec![FileOp::AddFile {
                 path: PathBuf::from("src/main.rs"),
-                content_blob,
             }],
             build_hash,
         );

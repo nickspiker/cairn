@@ -7,8 +7,8 @@
 //! what cargo compiled.
 
 use anyhow::{Context, Result};
-use std::process::{Command, exit};
 use std::path::PathBuf;
+use std::process::{Command, exit};
 
 fn main() {
     if let Err(e) = run() {
@@ -110,14 +110,24 @@ fn create_pending_snapshot() -> Result<bool> {
         .context("Failed to load repository state")?;
 
     // Scan current files
-    let current_files = cairn::snapshot::scan_working_directory()
-        .context("Failed to scan working directory")?;
+    let current_files =
+        cairn::snapshot::scan_working_directory().context("Failed to scan working directory")?;
 
-    // Get previous files
-    let previous_files = cairn::snapshot::get_previous_files(&state, &cairn_dir)?;
+    // Create snapshots for diffing
+    let new_snapshot = cairn::snapshot_vsf::create_snapshot(&current_files, &cairn_dir)
+        .context("Failed to create new snapshot")?;
 
-    // Compute diff
-    let operations = cairn::diff::compute_diff(&cairn_dir, &previous_files, &current_files)
+    let old_snapshot = if state.is_empty() {
+        // No previous snapshot - create empty one
+        let empty_files = std::collections::HashMap::new();
+        cairn::snapshot_vsf::create_snapshot(&empty_files, &cairn_dir)
+            .context("Failed to create empty initial snapshot")?
+    } else {
+        state.latest_snapshot
+    };
+
+    // Compute diff on x-encoded snapshots
+    let operations = cairn::diff::compute_diff(&cairn_dir, &old_snapshot, &new_snapshot)
         .context("Failed to compute diff")?;
 
     if operations.is_empty() {
@@ -126,10 +136,9 @@ fn create_pending_snapshot() -> Result<bool> {
     }
 
     // Store the current file state in pending file
-    let pending_data = bincode::serialize(&current_files)
-        .context("Failed to serialize pending snapshot")?;
-    std::fs::write(&pending_file, pending_data)
-        .context("Failed to write pending snapshot")?;
+    let pending_data =
+        bincode::serialize(&current_files).context("Failed to serialize pending snapshot")?;
+    std::fs::write(&pending_file, pending_data).context("Failed to write pending snapshot")?;
 
     Ok(true)
 }
@@ -144,10 +153,9 @@ fn commit_pending_snapshot() -> Result<()> {
     }
 
     // Read the pending snapshot
-    let pending_data = std::fs::read(&pending_file)
-        .context("Failed to read pending snapshot")?;
-    let snapshot_files: std::collections::HashMap<PathBuf, Vec<u8>> = bincode::deserialize(&pending_data)
-        .context("Failed to deserialize pending snapshot")?;
+    let pending_data = std::fs::read(&pending_file).context("Failed to read pending snapshot")?;
+    let snapshot_files: std::collections::HashMap<PathBuf, Vec<u8>> =
+        bincode::deserialize(&pending_data).context("Failed to deserialize pending snapshot")?;
 
     // Create the actual patch
     let build_hash = blake3::hash(b"cargo-cairn build"); // TODO: Use actual build output hash
@@ -158,8 +166,7 @@ fn commit_pending_snapshot() -> Result<()> {
         .context("Failed to create patch")?;
 
     // Remove pending file
-    std::fs::remove_file(&pending_file)
-        .context("Failed to remove pending snapshot")?;
+    std::fs::remove_file(&pending_file).context("Failed to remove pending snapshot")?;
 
     Ok(())
 }
@@ -170,8 +177,7 @@ fn discard_pending_snapshot() -> Result<()> {
     let pending_file = cairn_dir.join(".pending");
 
     if pending_file.exists() {
-        std::fs::remove_file(&pending_file)
-            .context("Failed to remove pending snapshot")?;
+        std::fs::remove_file(&pending_file).context("Failed to remove pending snapshot")?;
     }
 
     Ok(())
@@ -188,7 +194,9 @@ fn auto_init(cairn_dir: &PathBuf) -> Result<()> {
 
     // Create initial empty state
     let initial_state = cairn::state::RepositoryState::new();
-    initial_state.save(cairn_dir).context("Failed to save initial state")?;
+    initial_state
+        .save(cairn_dir)
+        .context("Failed to save initial state")?;
 
     Ok(())
 }

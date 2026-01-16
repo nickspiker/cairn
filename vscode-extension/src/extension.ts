@@ -11,6 +11,7 @@ const execAsync = promisify(exec);
 let cairnProvider: CairnProvider;
 let buildCommandsProvider: BuildCommandsProvider;
 let binaryManager: BinaryManager;
+let cairnTreeView: vscode.TreeView<any>;
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('Cairn extension activated');
@@ -20,7 +21,9 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Initialize cairn provider (tree view)
     cairnProvider = new CairnProvider(context, binaryManager);
-    vscode.window.registerTreeDataProvider('cairnHistory', cairnProvider);
+    cairnTreeView = vscode.window.createTreeView('cairnHistory', {
+        treeDataProvider: cairnProvider
+    });
 
     // Initialize build commands provider
     buildCommandsProvider = new BuildCommandsProvider();
@@ -104,6 +107,20 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    // Watch for .cairn/state.vsf changes in all workspace folders
+    const stateWatcher = vscode.workspace.createFileSystemWatcher('**/.cairn/state.vsf');
+    stateWatcher.onDidChange(() => cairnProvider.refresh());
+    stateWatcher.onDidCreate(() => cairnProvider.refresh());
+    stateWatcher.onDidDelete(() => cairnProvider.refresh());
+    context.subscriptions.push(stateWatcher);
+
+    // Refresh patch history when switching between files in different projects
+    context.subscriptions.push(
+        vscode.window.onDidChangeActiveTextEditor(() => {
+            cairnProvider.refreshIfCargoRootChanged();
+        })
+    );
+
     // Initial refresh
     cairnProvider.refresh();
 }
@@ -175,6 +192,19 @@ async function runBuildCommand(cargoCommand: string): Promise<void> {
 
         // Refresh the patch history after build
         cairnProvider.refresh();
+
+        // Wait a bit for the tree to update, then select the head patch
+        setTimeout(async () => {
+            const patches = await cairnProvider.getPatches();
+            const headPatch = patches.find(p => p.marker.includes('CURRENT'));
+            if (headPatch && cairnTreeView) {
+                const items = await cairnProvider.getChildren();
+                const headItem = items.find(item => item.patchId === headPatch.id);
+                if (headItem) {
+                    cairnTreeView.reveal(headItem, { select: true, focus: false });
+                }
+            }
+        }, 100);
 
         vscode.window.showInformationMessage(`✓ cargo cairn ${cargoCommand} completed`);
     } catch (error: any) {

@@ -2,7 +2,16 @@
 
 **Build-gated version control for Rust projects.**
 
-> **Status:** v0.0.1 - Actively tested on Linux. Windows/macOS binaries included but untested. Report issues!
+> **⚠️ EXPERIMENTAL - v0.0.0 - NOT PRODUCTION READY**
+>
+> **Do not use on critical projects.** While all data is hash-verified and should not corrupt, there are known issues:
+> - Random build hangs may occur
+> - Rollback may not properly roll forward on subsequent builds
+> - Snapshots may fail to save correctly in some cases
+>
+> This release is for testing and claiming the crate name. Actively developed on Linux only. Windows/macOS untested.
+>
+> **Use at your own risk. Always have git backups.**
 
 ---
 
@@ -197,12 +206,20 @@ git add -A && git commit  # When ready, commit to git
 
 ---
 
-## Current Limitations
+## Known Issues & Limitations
 
+**Current stability issues:**
+- Random build hangs (investigating)
+- Rollback may not cleanly roll forward on next build
+- Snapshot saves may silently fail in edge cases
+
+**Design limitations:**
 - **Linear history** - No merges yet
 - **Rust-only** - Assumes cargo build (other languages planned)
 - **Local-only** - No remote sync yet
 - **Linux tested** - Windows/macOS builds included but untested
+
+**Recommendation:** Use alongside Git. Cairn should complement, not replace, your version control.
 
 ---
 
@@ -229,3 +246,4 @@ MIT or Apache-2.0, your choice.
 ---
 
 **Cairn: Because every successful build deserves to be saved.**
+# Test

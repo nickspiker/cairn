@@ -48,35 +48,34 @@ pub enum ByteOp {
     },
 }
 
-/// File operations with binary diffs and blob storage
+/// File operations with binary diffs on x-encoded content
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileOp {
-    /// Modified file - stores diff from base blob
+    /// Modified file - stores diff from base snapshot
     ModifyFile {
         /// File path
         path: PathBuf,
-        /// BLAKE3 hash of base content (provenance - identifies blob)
-        base_blob: [u8; 32],
-        /// Binary diff operations
+        /// BLAKE3 hash of base snapshot (provenance - identifies snapshot VSF)
+        base_snapshot: [u8; 32],
+        /// Binary diff operations on x-encoded content
         operations: Vec<ByteOp>,
-        /// Expected BLAKE3 hash after applying operations (integrity check)
+        /// Expected BLAKE3 hash of x-encoded result (provenance check)
         result_hash: [u8; 32],
     },
 
-    /// New file - stores full content as blob
+    /// New file - content stored in new snapshot
     AddFile {
         /// File path
         path: PathBuf,
-        /// BLAKE3 hash of content (provenance - identifies blob)
-        content_blob: [u8; 32],
+        // No content_blob - new files are in the new snapshot
     },
 
     /// Deleted file
     DeleteFile {
         /// File path
         path: PathBuf,
-        /// BLAKE3 hash of deleted content (provenance)
-        old_blob: [u8; 32],
+        /// BLAKE3 hash of snapshot containing the deleted file (provenance)
+        old_snapshot: [u8; 32],
     },
 
     /// Renamed file - metadata only
@@ -132,7 +131,8 @@ impl Patch {
 }
 
 pub fn get_author_id() -> AuthorId {
-    let name = std::env::var("CAIRN_AUTHOR_NAME").unwrap_or_else(|_| "cairn-default-author".to_string());
+    let name =
+        std::env::var("CAIRN_AUTHOR_NAME").unwrap_or_else(|_| "cairn-default-author".to_string());
     let email = std::env::var("CAIRN_AUTHOR_EMAIL").unwrap_or_else(|_| "".to_string());
 
     let author_string = if email.is_empty() {
@@ -151,22 +151,17 @@ mod tests {
     #[test]
     fn test_patch_creation() {
         let author = get_author_id();
-        let timestamp = 1234567890.0;
+        let timestamp = 1234567890;
         let build_hash = *blake3::hash(b"test build output").as_bytes();
-
-        let content_blob = *blake3::hash(b"fn main() {\n    println!(\"Hello\");\n}").as_bytes();
 
         let patch = Patch::new(
             author,
             None, // Initial patch
             timestamp,
             "Initial patch".to_string(),
-            vec![
-                FileOp::AddFile {
-                    path: PathBuf::from("src/main.rs"),
-                    content_blob,
-                },
-            ],
+            vec![FileOp::AddFile {
+                path: PathBuf::from("src/main.rs"),
+            }],
             build_hash,
         );
 

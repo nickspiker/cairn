@@ -1,10 +1,10 @@
-//! VSF decoding for cairn patches with binary diff and blob storage
+//! VSF decoding for cairn patches with binary diffs on x-encoded snapshots
 //!
 //! Parses VSF-encoded patches back into Rust structures.
 //! Decodes FileOp with ByteOp from byte vectors.
 
 use crate::patch::{ByteOp, FileOp, Patch, PatchId, PatchMetadata};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use vsf::{VsfHeader, VsfSection, VsfType};
 
 impl Patch {
@@ -30,12 +30,11 @@ impl Patch {
                 continue;
             }
 
-
             // Jump to section offset
             ptr = field.offset_bytes;
 
             if ptr >= bytes.len() {
-                continue; // Skip if offset is beyond data
+                continue; // Skip if offset is beyond data 
             }
 
             // Parse section
@@ -71,10 +70,7 @@ impl Patch {
 }
 
 /// Decode metadata section
-fn decode_metadata_section(
-    section: &VsfSection,
-    _header: &VsfHeader,
-) -> Result<PatchMetadata> {
+fn decode_metadata_section(section: &VsfSection, _header: &VsfHeader) -> Result<PatchMetadata> {
     let author = extract_hash(section, "author")?;
     let parent = extract_hash_opt(section, "parent");
     let message = extract_string(section, "message")?;
@@ -103,44 +99,43 @@ fn decode_operations_section(section: &VsfSection) -> Result<Vec<FileOp>> {
 
         let op = match op_type {
             0 => {
-                // ModifyFile: [op_type, path, base_blob, result_hash, byte_ops_encoded]
+                // ModifyFile: [op_type, path, base_snapshot, result_hash, byte_ops_encoded]
                 if field.values.len() < 5 {
                     return Err(anyhow!("ModifyFile operation missing values"));
                 }
 
                 let path = extract_pathbuf_from_value(&field.values[1])?;
-                let base_blob = extract_hash_from_value(&field.values[2])?;
+                let base_snapshot = extract_hash_from_value(&field.values[2])?;
                 let result_hash = extract_hash_from_value(&field.values[3])?;
                 let byte_ops_encoded = extract_bytes_from_value(&field.values[4])?;
 
-                // Decode ByteOp operations
+                // Decode ByteOp operations (on x-encoded content)
                 let operations = decode_byte_ops(&byte_ops_encoded)?;
 
                 FileOp::ModifyFile {
                     path,
-                    base_blob,
+                    base_snapshot,
                     operations,
                     result_hash,
                 }
             }
             1 => {
-                // AddFile: [op_type, path, content_blob]
-                if field.values.len() < 3 {
+                // AddFile: [op_type, path] (content is in new snapshot)
+                if field.values.len() < 2 {
                     return Err(anyhow!("AddFile operation missing values"));
                 }
                 FileOp::AddFile {
                     path: extract_pathbuf_from_value(&field.values[1])?,
-                    content_blob: extract_hash_from_value(&field.values[2])?,
                 }
             }
             2 => {
-                // DeleteFile: [op_type, path, old_blob]
+                // DeleteFile: [op_type, path, old_snapshot]
                 if field.values.len() < 3 {
                     return Err(anyhow!("DeleteFile operation missing values"));
                 }
                 FileOp::DeleteFile {
                     path: extract_pathbuf_from_value(&field.values[1])?,
-                    old_blob: extract_hash_from_value(&field.values[2])?,
+                    old_snapshot: extract_hash_from_value(&field.values[2])?,
                 }
             }
             3 => {
@@ -253,7 +248,13 @@ fn extract_hash(section: &VsfSection, field_name: &str) -> Result<[u8; 32]> {
     }
 
     match &field.values[0] {
-        VsfType::hp(bytes) | VsfType::hb(bytes) | VsfType::hs(bytes) | VsfType::hm(bytes) | VsfType::hg(bytes) | VsfType::hc(bytes) | VsfType::hk(bytes) => {
+        VsfType::hp(bytes)
+        | VsfType::hb(bytes)
+        | VsfType::hs(bytes)
+        | VsfType::hm(bytes)
+        | VsfType::hg(bytes)
+        | VsfType::hc(bytes)
+        | VsfType::hk(bytes) => {
             if bytes.len() == 32 {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(bytes);
@@ -355,9 +356,11 @@ fn extract_pathbuf_from_value(value: &VsfType) -> Result<std::path::PathBuf> {
 fn extract_eagle_time(value: &VsfType) -> Result<usize> {
     match value {
         VsfType::e(et_type) => match et_type {
-            vsf::EtType::u(u) => Ok(*u),
+            vsf::EtType::u(u) => Ok(*u as usize),
             vsf::EtType::i(i) => Ok(*i as usize),
-            _ => Err(anyhow!("Eagle Time must be stored as oscillation count (u/i type)")),
+            _ => Err(anyhow!(
+                "Eagle Time must be stored as oscillation count (u/i type)"
+            )),
         },
         _ => Err(anyhow!("Not an Eagle Time type")),
     }
@@ -379,7 +382,13 @@ fn extract_timestamp(section: &VsfSection, field_name: &str) -> Result<usize> {
 /// Extract a hash from a VsfType value (for inline hash extraction)
 fn extract_hash_from_value(value: &VsfType) -> Result<[u8; 32]> {
     match value {
-        VsfType::hp(bytes) | VsfType::hb(bytes) | VsfType::hs(bytes) | VsfType::hm(bytes) | VsfType::hg(bytes) | VsfType::hc(bytes) | VsfType::hk(bytes) => {
+        VsfType::hp(bytes)
+        | VsfType::hb(bytes)
+        | VsfType::hs(bytes)
+        | VsfType::hm(bytes)
+        | VsfType::hg(bytes)
+        | VsfType::hc(bytes)
+        | VsfType::hk(bytes) => {
             if bytes.len() == 32 {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(bytes);
@@ -405,10 +414,9 @@ mod tests {
     fn test_roundtrip_patch() {
         let author = get_author_id();
         let build_hash = *blake3::hash(b"test build output").as_bytes();
-        let content_blob = *blake3::hash(b"file content").as_bytes();
-        let base_blob = *blake3::hash(b"base content").as_bytes();
-        let result_hash = *blake3::hash(b"result content").as_bytes();
-        let old_blob = *blake3::hash(b"old content").as_bytes();
+        let base_snapshot = *blake3::hash(b"base snapshot").as_bytes();
+        let result_hash = *blake3::hash(b"result x-encoded content").as_bytes();
+        let old_snapshot = *blake3::hash(b"old snapshot").as_bytes();
 
         let original = Patch::new(
             author,
@@ -418,11 +426,10 @@ mod tests {
             vec![
                 FileOp::AddFile {
                     path: PathBuf::from("src/new.rs"),
-                    content_blob,
                 },
                 FileOp::ModifyFile {
                     path: PathBuf::from("src/main.rs"),
-                    base_blob,
+                    base_snapshot,
                     operations: vec![
                         ByteOp::Copy { start: 0, len: 10 },
                         ByteOp::Insert {
@@ -433,7 +440,7 @@ mod tests {
                 },
                 FileOp::DeleteFile {
                     path: PathBuf::from("src/old.rs"),
-                    old_blob,
+                    old_snapshot,
                 },
                 FileOp::RenameFile {
                     from: PathBuf::from("old.txt"),
@@ -476,7 +483,7 @@ mod tests {
         let original = Patch::new(
             author,
             Some(parent),
-            1234567890.0,
+            1234567890,
             "Child patch".to_string(),
             vec![],
             build_hash,

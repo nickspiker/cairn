@@ -8,13 +8,14 @@
 
 use crate::diff;
 use crate::patch::{Patch, get_author_id};
+use crate::snapshot_vsf;
 use crate::state::RepositoryState;
 use anyhow::{Context, Result};
 use blake3::Hash;
 use std::collections::HashMap;
 use std::fs;
-use vsf::types::eagle_time;
 use std::path::PathBuf;
+use vsf::types::eagle_time;
 use vsf::verification::compute_provenance_hash;
 
 /// Create a patch from pre-captured file state
@@ -29,15 +30,26 @@ pub fn create_snapshot_from_files(
     current_files: HashMap<PathBuf, Vec<u8>>,
 ) -> Result<String> {
     // Load current repository state
-    let mut repo_state = RepositoryState::load(cairn_dir)
-        .context("Failed to load repository state")?;
+    let mut repo_state =
+        RepositoryState::load(cairn_dir).context("Failed to load repository state")?;
 
-    // Get previous state from repository
-    let previous_files = get_previous_files(&repo_state, cairn_dir)?;
+    // Create snapshot VSF for current state (new snapshot)
+    let new_snapshot = snapshot_vsf::create_snapshot(&current_files, cairn_dir)
+        .context("Failed to create new snapshot VSF")?;
 
-    // Compute delta operations
-    let operations = diff::compute_diff(cairn_dir, &previous_files, &current_files)
-        .context("Failed to compute delta")?;
+    // Get old snapshot hash from repository state
+    let old_snapshot = if repo_state.is_empty() {
+        // No previous snapshot - create empty one
+        let empty_files = HashMap::new();
+        snapshot_vsf::create_snapshot(&empty_files, cairn_dir)
+            .context("Failed to create empty initial snapshot")?
+    } else {
+        repo_state.latest_snapshot
+    };
+
+    // Compute delta operations on x-encoded snapshots
+    let operations = diff::compute_diff(cairn_dir, &old_snapshot, &new_snapshot)
+        .context("Failed to compute delta on snapshots")?;
 
     if operations.is_empty() {
         println!("No changes detected - skipping patch");
@@ -54,7 +66,8 @@ pub fn create_snapshot_from_files(
         let parent_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(&repo_state.head)
             .context("Failed to decode parent patch ID")?;
-        let parent_hash: [u8; 32] = parent_bytes.try_into()
+        let parent_hash: [u8; 32] = parent_bytes
+            .try_into()
             .map_err(|_| anyhow::anyhow!("Parent patch ID must be 32 bytes"))?;
         Some(parent_hash)
     };
@@ -62,15 +75,14 @@ pub fn create_snapshot_from_files(
     let patch = Patch::new(
         get_author_id(),
         parent,
-        timestamp,
+        timestamp as usize,
         message,
         operations,
         *build_hash.as_bytes(),
     );
 
     // Encode patch to VSF
-    let patch_bytes = patch.encode_vsf()
-        .context("Failed to encode patch")?;
+    let patch_bytes = patch.encode_vsf().context("Failed to encode patch")?;
 
     // Extract VSF provenance hash and encode as base64url for filename
     let provenance_hash = compute_provenance_hash(&patch_bytes)
@@ -82,15 +94,10 @@ pub fn create_snapshot_from_files(
     fs::write(&patch_path, patch_bytes)
         .with_context(|| format!("Failed to write patch file: {:?}", patch_path))?;
 
-    // Compute file hashes for state
-    let file_hashes = current_files
-        .iter()
-        .map(|(path, content)| (path.clone(), *blake3::hash(content).as_bytes()))
-        .collect();
-
-    // Update repository state
-    repo_state.add_patch(patch_id.clone(), file_hashes);
-    repo_state.save(cairn_dir)
+    // Update repository state with new snapshot hash (already created above)
+    repo_state.add_patch(patch_id.clone(), new_snapshot);
+    repo_state
+        .save(cairn_dir)
         .context("Failed to save repository state")?;
 
     Ok(patch_id)
@@ -100,86 +107,78 @@ pub fn create_snapshot_from_files(
 ///
 /// This is the main entry point called after a successful build.
 /// Returns the patch ID of the newly created patch.
-pub fn create_snapshot(
-    cairn_dir: &PathBuf,
-    message: String,
-    build_hash: Hash,
-) -> Result<String> {
+pub fn create_snapshot(cairn_dir: &PathBuf, message: String, build_hash: Hash) -> Result<String> {
     // Scan working directory for files
-    let current_files = scan_working_directory()
-        .context("Failed to scan working directory")?;
+    let current_files = scan_working_directory().context("Failed to scan working directory")?;
 
     // Create snapshot from those files
     create_snapshot_from_files(cairn_dir, message, build_hash, current_files)
 }
 
-/// Scan working directory for all files (excluding .cairn, target, .git)
+/// Scan working directory for all files
+///
+/// Respects .gitignore patterns and automatically excludes:
+/// - .cairn/ directory
+/// - target/ directory
+/// - .git/ directory
+/// - Hidden files/directories (starting with .)
+/// - All patterns in .gitignore
 pub fn scan_working_directory() -> Result<HashMap<PathBuf, Vec<u8>>> {
+    use ignore::WalkBuilder;
+
     let mut files = HashMap::new();
+    let current_dir = std::env::current_dir().context("Failed to get current directory")?;
 
-    // Get current directory
-    let current_dir = std::env::current_dir()
-        .context("Failed to get current directory")?;
+    // Build walker that respects .gitignore
+    let walker = WalkBuilder::new(&current_dir)
+        .hidden(true) // Skip hidden files/dirs (starting with .)
+        .git_ignore(true) // Respect .gitignore
+        .git_exclude(true) // Respect .git/info/exclude
+        .require_git(false) // Don't require git repo
+        .add_custom_ignore_filename(".cairnignore") // Support .cairnignore too
+        .build();
 
-    // Walk directory tree
-    scan_directory(&current_dir, &current_dir.clone(), &mut files)?;
-
-    Ok(files)
-}
-
-/// Recursively scan a directory, collecting all files
-fn scan_directory(
-    base_dir: &PathBuf,
-    current_dir: &PathBuf,
-    files: &mut HashMap<PathBuf, Vec<u8>>,
-) -> Result<()> {
-    for entry in fs::read_dir(current_dir)? {
-        let entry = entry?;
+    for result in walker {
+        let entry = result.context("Failed to read directory entry")?;
         let path = entry.path();
-        let file_name = entry.file_name();
 
-        // Skip excluded directories
-        if path.is_dir() {
-            let name = file_name.to_string_lossy();
-            if name == ".cairn"
-                || name == "target"
-                || name == ".git"
-                || name == "node_modules"
-                || name == "out"
-                || name == "dist"
-                || name.starts_with('.')
-            {
-                continue;
-            }
-
-            // Recurse into subdirectory
-            scan_directory(base_dir, &path.to_path_buf(), files)?;
-        } else if path.is_file() {
-            // Skip hidden files and build artifacts
-            let name = file_name.to_string_lossy();
-            if name.starts_with('.')
-                || name.ends_with(".vsix")
-                || name.ends_with(".wasm")
-                || name == "package-lock.json"
-                || name == "Cargo.lock"
-            {
-                continue;
-            }
-
-            // Read file content
-            let content = fs::read(&path)
-                .with_context(|| format!("Failed to read file: {:?}", path))?;
-
-            // Store with relative path from base_dir
-            let relative_path = path.strip_prefix(base_dir)
-                .expect("Path should be under base_dir")
-                .to_path_buf();
-
-            files.insert(relative_path, content);
+        // Only process files (not directories)
+        if !path.is_file() {
+            continue;
         }
+
+        // Always skip .cairn directory explicitly
+        if path.starts_with(&current_dir.join(".cairn")) {
+            continue;
+        }
+
+        // Skip lock files and build artifacts
+        let file_name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        if file_name == "Cargo.lock"
+            || file_name == "package-lock.json"
+            || file_name.ends_with(".vsix")
+            || file_name.ends_with(".wasm")
+        {
+            continue;
+        }
+
+        // Read file content
+        let content = fs::read(path)
+            .with_context(|| format!("Failed to read file: {:?}", path))?;
+
+        // Store with relative path
+        let relative_path = path
+            .strip_prefix(&current_dir)
+            .context("Path should be under current directory")?
+            .to_path_buf();
+
+        files.insert(relative_path, content);
     }
 
-    Ok(())
+    Ok(files)
 }
 
 /// Get the file tree from the previous patch
@@ -192,21 +191,111 @@ pub fn get_previous_files(
         return Ok(HashMap::new());
     }
 
-    // Reconstruct file tree by applying all patches up to CURRENT
-    let mut current_files = HashMap::new();
+    // Get the snapshot hash from the latest patch in the repo state
+    let latest_snapshot_hash = &repo_state.latest_snapshot;
 
-    for patch_id in &repo_state.patches {
-        let patch_path = cairn_dir.join("patches").join(patch_id);
-        let patch_bytes = fs::read(&patch_path)
-            .with_context(|| format!("Failed to read patch: {:?}", patch_path))?;
+    // Read all files from the snapshot VSF
+    read_all_files_from_snapshot(cairn_dir, latest_snapshot_hash)
+}
 
-        let patch = crate::patch::Patch::decode_vsf(&patch_bytes)
-            .context("Failed to decode patch")?;
+/// Read all files from a snapshot VSF
+fn read_all_files_from_snapshot(
+    cairn_dir: &PathBuf,
+    snapshot_hash: &[u8; 32],
+) -> Result<HashMap<PathBuf, Vec<u8>>> {
+    let snapshot_path = cairn_dir
+        .join("snapshots")
+        .join(format!("{}.vsf", hex::encode(snapshot_hash)));
 
-        current_files = crate::apply::apply_operations(cairn_dir, &current_files, &patch.operations)?;
+    let bytes = fs::read(&snapshot_path).context(format!(
+        "Failed to load snapshot: {}",
+        hex::encode(snapshot_hash)
+    ))?;
+
+    // Parse VSF header
+    let (header, _) = vsf::VsfHeader::decode(&bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to decode VSF header: {}", e))?;
+
+    // Find the "files" section
+    let files_field = header
+        .fields
+        .iter()
+        .find(|f| f.name == "files")
+        .context("Snapshot missing 'files' section")?;
+
+    // Parse the files section
+    let mut ptr = files_field.offset_bytes;
+    let files_section = vsf::file_format::VsfSection::parse(&bytes, &mut ptr)
+        .map_err(|e| anyhow::anyhow!("Failed to parse files section: {}", e))?;
+
+    // Recursively extract all files from the section tree
+    let mut files = HashMap::new();
+    extract_files_recursive(&files_section, &PathBuf::new(), &mut files)?;
+
+    Ok(files)
+}
+
+/// Recursively extract files from nested VSF sections
+fn extract_files_recursive(
+    section: &vsf::file_format::VsfSection,
+    current_path: &PathBuf,
+    files: &mut HashMap<PathBuf, Vec<u8>>,
+) -> Result<()> {
+    // Check if this section has a "content" field (it's a file)
+    if let Some(content_field) = section.get_field("content") {
+        if let Some(value) = content_field.values.first() {
+            let content = match value {
+                vsf::VsfType::x(text) => text.as_bytes().to_vec(),
+                vsf::VsfType::v(b'b', bytes) => bytes.clone(),
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Unexpected content type in section: {:?}",
+                        section.name
+                    ));
+                }
+            };
+
+            // Denormalize just the filename (last component) since the directory path
+            // is already built up correctly in current_path
+            let denormalized_path = if let Some(parent) = current_path.parent() {
+                parent.join(denormalize_name(&section.name))
+            } else {
+                PathBuf::from(denormalize_name(&section.name))
+            };
+            files.insert(denormalized_path, content);
+        }
+
+        // File sections shouldn't have subsections - skip recursion to avoid path doubling
+        return Ok(());
     }
 
-    Ok(current_files)
+    // This is a directory section - recurse into subdirectories and files
+    for subsection in &section.subsections {
+        let subsection_name = denormalize_name(&subsection.name);
+        let subsection_path = current_path.join(subsection_name);
+        extract_files_recursive(subsection, &subsection_path, files)?;
+    }
+
+    Ok(())
+}
+
+/// Denormalize a VSF-compliant name back to original form
+/// Reverses the normalize_name transformation
+fn denormalize_name(name: &str) -> String {
+    // Find the last underscore that separates base from extension
+    if let Some(last_underscore) = name.rfind('_') {
+        let (base, ext) = name.split_at(last_underscore);
+        // If the extension looks like a file extension (2-5 chars), restore the dot
+        let ext_part = &ext[1..]; // Skip the underscore
+        if ext_part.len() >= 2
+            && ext_part.len() <= 5
+            && ext_part.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return format!("{}.{}", base, ext_part);
+        }
+    }
+    // No valid extension found, just return as-is
+    name.to_string()
 }
 
 /// Base64 URL-safe encoding (no padding)
@@ -243,8 +332,14 @@ mod tests {
         let files = scan_working_directory().unwrap();
 
         assert_eq!(files.len(), 2);
-        assert_eq!(files.get(&PathBuf::from("test.txt")), Some(&b"content".to_vec()));
-        assert_eq!(files.get(&PathBuf::from("subdir/nested.txt")), Some(&b"nested".to_vec()));
+        assert_eq!(
+            files.get(&PathBuf::from("test.txt")),
+            Some(&b"content".to_vec())
+        );
+        assert_eq!(
+            files.get(&PathBuf::from("subdir/nested.txt")),
+            Some(&b"nested".to_vec())
+        );
     }
 
     #[test]
@@ -265,7 +360,10 @@ mod tests {
         // (Allow for hidden files that might exist in temp_dir)
         assert!(files.contains_key(&PathBuf::from("test.txt")));
         assert!(!files.contains_key(&PathBuf::from(".cairn/state.vsf")));
-        assert_eq!(files.get(&PathBuf::from("test.txt")), Some(&b"content".to_vec()));
+        assert_eq!(
+            files.get(&PathBuf::from("test.txt")),
+            Some(&b"content".to_vec())
+        );
     }
 
     #[test]
@@ -278,5 +376,4 @@ mod tests {
         assert!(!encoded.contains('/'));
         assert!(!encoded.contains('='));
     }
-
 }

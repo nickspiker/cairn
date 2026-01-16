@@ -1,11 +1,11 @@
 //! Apply patch operations with BLAKE3 verification
 //!
-//! Reconstructs files from binary diffs and blob storage.
+//! Reconstructs files from binary diffs on x-encoded snapshot content.
 //! Validates BLAKE3 hashes before applying to ensure integrity.
 
-use crate::blob::read_blob;
 use crate::patch::{ByteOp, FileOp};
-use anyhow::{anyhow, Context, Result};
+use crate::snapshot_vsf::{extract_encoded_file, read_file_from_snapshot};
+use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -14,11 +14,13 @@ use std::path::{Path, PathBuf};
 /// Operations are validated atomically - all BLAKE3 hashes are verified
 /// before applying any changes. This ensures repository state remains consistent.
 ///
-/// Returns the new file tree state after applying all operations.
+/// Takes the new snapshot hash to read file content for AddFile operations.
+/// Returns the new file tree state (plaintext) after applying all operations.
 pub fn apply_operations(
     cairn_dir: &Path,
     files: &HashMap<PathBuf, Vec<u8>>,
     operations: &[FileOp],
+    new_snapshot: &[u8; 32],
 ) -> Result<HashMap<PathBuf, Vec<u8>>> {
     // Phase 1: Validate all operations and reconstruct all files
     // We do this BEFORE modifying any state to ensure atomicity
@@ -28,19 +30,21 @@ pub fn apply_operations(
         match op {
             FileOp::ModifyFile {
                 path,
-                base_blob,
+                base_snapshot,
                 operations: byte_ops,
                 result_hash,
             } => {
-                // Read base blob from storage
-                let base_content = read_blob(cairn_dir, base_blob)
-                    .with_context(|| format!("Failed to read base blob for {:?}", path))?;
+                // Read x-encoded base content from snapshot
+                let base_content = extract_encoded_file(cairn_dir, base_snapshot, path)
+                    .with_context(|| {
+                        format!("Failed to read base content for {:?} from snapshot", path)
+                    })?;
 
-                // Reconstruct file from ByteOp operations
-                let reconstructed = reconstruct_from_ops(&base_content, byte_ops)?;
+                // Reconstruct x-encoded file from ByteOp operations
+                let reconstructed_encoded = reconstruct_from_ops(&base_content, byte_ops)?;
 
-                // Verify BLAKE3 hash matches expected result
-                let computed_hash = *blake3::hash(&reconstructed).as_bytes();
+                // Verify BLAKE3 hash matches expected result (hash of x-encoded content)
+                let computed_hash = *blake3::hash(&reconstructed_encoded).as_bytes();
                 if &computed_hash != result_hash {
                     return Err(anyhow!(
                         "BLAKE3 hash mismatch for {:?}\nExpected: {}\nComputed: {}",
@@ -50,13 +54,21 @@ pub fn apply_operations(
                     ));
                 }
 
-                reconstructed_files.insert(path.clone(), reconstructed);
+                // Decode x-encoded result to plaintext for working directory
+                let plaintext = read_file_from_snapshot(cairn_dir, new_snapshot, path)
+                    .with_context(|| {
+                        format!("Failed to decode reconstructed content for {:?}", path)
+                    })?;
+
+                reconstructed_files.insert(path.clone(), plaintext);
             }
 
-            FileOp::AddFile { path, content_blob } => {
-                // Read full content from blob storage
-                let content = read_blob(cairn_dir, content_blob)
-                    .with_context(|| format!("Failed to read content blob for {:?}", path))?;
+            FileOp::AddFile { path } => {
+                // Read full content from new snapshot
+                let content =
+                    read_file_from_snapshot(cairn_dir, new_snapshot, path).with_context(|| {
+                        format!("Failed to read added file {:?} from snapshot", path)
+                    })?;
 
                 // Verify the file doesn't already exist
                 if files.contains_key(path) {
@@ -66,19 +78,27 @@ pub fn apply_operations(
                 reconstructed_files.insert(path.clone(), content);
             }
 
-            FileOp::DeleteFile { path, old_blob } => {
-                // Verify the file exists and hash matches
+            FileOp::DeleteFile { path, old_snapshot } => {
+                // Read expected old content from old snapshot
+                let old_content = read_file_from_snapshot(cairn_dir, old_snapshot, path)
+                    .with_context(|| {
+                        format!(
+                            "Failed to read file {:?} from old snapshot for deletion verification",
+                            path
+                        )
+                    })?;
+
+                // Verify the file exists and content matches
                 let current_content = files
                     .get(path)
                     .ok_or_else(|| anyhow!("File to delete does not exist: {:?}", path))?;
 
-                let current_hash = *blake3::hash(current_content).as_bytes();
-                if &current_hash != old_blob {
+                if current_content != &old_content {
                     return Err(anyhow!(
-                        "File content mismatch for deletion of {:?}\nExpected: {}\nCurrent: {}",
+                        "File content mismatch for deletion of {:?}\nSnapshot content hash: {}\nCurrent content hash: {}",
                         path,
-                        hex::encode(old_blob),
-                        hex::encode(current_hash)
+                        hex::encode(blake3::hash(&old_content).as_bytes()),
+                        hex::encode(blake3::hash(current_content).as_bytes())
                     ));
                 }
 
@@ -107,7 +127,7 @@ pub fn apply_operations(
 
     for op in operations {
         match op {
-            FileOp::ModifyFile { path, .. } | FileOp::AddFile { path, .. } => {
+            FileOp::ModifyFile { path, .. } | FileOp::AddFile { path } => {
                 // Insert reconstructed/new file
                 let content = reconstructed_files
                     .remove(path)
@@ -134,7 +154,7 @@ pub fn apply_operations(
 /// Reconstruct file content from ByteOp operations
 ///
 /// Processes Copy and Insert operations sequentially to rebuild the file.
-/// All Copy operations reference absolute byte positions in the immutable base blob.
+/// All Copy operations reference absolute byte positions in the immutable x-encoded base content.
 fn reconstruct_from_ops(base_content: &[u8], operations: &[ByteOp]) -> Result<Vec<u8>> {
     let mut output = Vec::new();
 
@@ -170,7 +190,7 @@ fn reconstruct_from_ops(base_content: &[u8], operations: &[ByteOp]) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::write_blob;
+    use crate::snapshot_vsf::create_snapshot;
     use tempfile::TempDir;
 
     #[test]
@@ -228,18 +248,23 @@ mod tests {
 
         let files = HashMap::new();
 
+        // Create new snapshot with the added file
         let content = b"hello world";
-        let content_blob = write_blob(cairn_dir, content).unwrap();
+        let mut new_files = HashMap::new();
+        new_files.insert(PathBuf::from("test.txt"), content.to_vec());
+        let new_snapshot = create_snapshot(&new_files, cairn_dir).unwrap();
 
         let ops = vec![FileOp::AddFile {
             path: PathBuf::from("test.txt"),
-            content_blob,
         }];
 
-        let result = apply_operations(cairn_dir, &files, &ops).unwrap();
+        let result = apply_operations(cairn_dir, &files, &ops, &new_snapshot).unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result.get(&PathBuf::from("test.txt")), Some(&content.to_vec()));
+        assert_eq!(
+            result.get(&PathBuf::from("test.txt")),
+            Some(&content.to_vec())
+        );
     }
 
     #[test]
@@ -251,14 +276,19 @@ mod tests {
         let mut files = HashMap::new();
         files.insert(PathBuf::from("test.txt"), content.to_vec());
 
-        let old_blob = *blake3::hash(content).as_bytes();
+        // Create old snapshot with the file to be deleted
+        let old_snapshot = create_snapshot(&files, cairn_dir).unwrap();
+
+        // Create new snapshot (empty)
+        let new_files = HashMap::new();
+        let new_snapshot = create_snapshot(&new_files, cairn_dir).unwrap();
 
         let ops = vec![FileOp::DeleteFile {
             path: PathBuf::from("test.txt"),
-            old_blob,
+            old_snapshot,
         }];
 
-        let result = apply_operations(cairn_dir, &files, &ops).unwrap();
+        let result = apply_operations(cairn_dir, &files, &ops, &new_snapshot).unwrap();
 
         assert_eq!(result.len(), 0);
     }
@@ -269,31 +299,47 @@ mod tests {
         let cairn_dir = temp_dir.path();
 
         let old_content = b"hello world";
-        let base_blob = write_blob(cairn_dir, old_content).unwrap();
-
         let mut files = HashMap::new();
         files.insert(PathBuf::from("test.txt"), old_content.to_vec());
 
-        // Modify to "hello rust world"
-        let byte_ops = vec![
-            ByteOp::Copy { start: 0, len: 6 },
-            ByteOp::Insert {
-                content: b"rust ".to_vec(),
-            },
-            ByteOp::Copy { start: 6, len: 5 },
-        ];
+        // Create old snapshot
+        let old_snapshot = create_snapshot(&files, cairn_dir).unwrap();
 
+        // Create new snapshot with modified content
         let new_content = b"hello rust world";
-        let result_hash = *blake3::hash(new_content).as_bytes();
+        let mut new_files = HashMap::new();
+        new_files.insert(PathBuf::from("test.txt"), new_content.to_vec());
+        let new_snapshot = create_snapshot(&new_files, cairn_dir).unwrap();
+
+        // Extract x-encoded content for diffing
+        let old_encoded = crate::snapshot_vsf::extract_encoded_file(
+            cairn_dir,
+            &old_snapshot,
+            &PathBuf::from("test.txt"),
+        )
+        .unwrap();
+        let new_encoded = crate::snapshot_vsf::extract_encoded_file(
+            cairn_dir,
+            &new_snapshot,
+            &PathBuf::from("test.txt"),
+        )
+        .unwrap();
+
+        // Generate ByteOps on x-encoded content (simplified - just replace all)
+        let byte_ops = vec![ByteOp::Insert {
+            content: new_encoded.clone(),
+        }];
+
+        let result_hash = *blake3::hash(&new_encoded).as_bytes();
 
         let ops = vec![FileOp::ModifyFile {
             path: PathBuf::from("test.txt"),
-            base_blob,
+            base_snapshot: old_snapshot,
             operations: byte_ops,
             result_hash,
         }];
 
-        let result = apply_operations(cairn_dir, &files, &ops).unwrap();
+        let result = apply_operations(cairn_dir, &files, &ops, &new_snapshot).unwrap();
 
         assert_eq!(
             result.get(&PathBuf::from("test.txt")),
@@ -309,15 +355,21 @@ mod tests {
         let mut files = HashMap::new();
         files.insert(PathBuf::from("old.txt"), b"content".to_vec());
 
+        // Create empty snapshot (rename doesn't need snapshot content)
+        let empty_snapshot = create_snapshot(&HashMap::new(), cairn_dir).unwrap();
+
         let ops = vec![FileOp::RenameFile {
             from: PathBuf::from("old.txt"),
             to: PathBuf::from("new.txt"),
         }];
 
-        let result = apply_operations(cairn_dir, &files, &ops).unwrap();
+        let result = apply_operations(cairn_dir, &files, &ops, &empty_snapshot).unwrap();
 
         assert!(!result.contains_key(&PathBuf::from("old.txt")));
-        assert_eq!(result.get(&PathBuf::from("new.txt")), Some(&b"content".to_vec()));
+        assert_eq!(
+            result.get(&PathBuf::from("new.txt")),
+            Some(&b"content".to_vec())
+        );
     }
 
     #[test]
@@ -326,29 +378,52 @@ mod tests {
         let cairn_dir = temp_dir.path();
 
         let old_content = b"hello";
-        let base_blob = write_blob(cairn_dir, old_content).unwrap();
-
         let mut files = HashMap::new();
         files.insert(PathBuf::from("test.txt"), old_content.to_vec());
+
+        // Create snapshots
+        let old_snapshot = create_snapshot(&files, cairn_dir).unwrap();
+        let mut new_files = HashMap::new();
+        new_files.insert(PathBuf::from("test.txt"), b"correct".to_vec());
+        let new_snapshot = create_snapshot(&new_files, cairn_dir).unwrap();
+
+        // Extract x-encoded content
+        let old_encoded = crate::snapshot_vsf::extract_encoded_file(
+            cairn_dir,
+            &old_snapshot,
+            &PathBuf::from("test.txt"),
+        )
+        .unwrap();
 
         let byte_ops = vec![ByteOp::Insert {
             content: b"wrong".to_vec(),
         }];
 
-        // Provide WRONG result hash (hash of "correct" instead of "wrong")
-        let result_hash = *blake3::hash(b"correct").as_bytes();
+        // Provide WRONG result hash (hash of "correct" x-encoded instead of "wrong")
+        let correct_encoded = crate::snapshot_vsf::extract_encoded_file(
+            cairn_dir,
+            &new_snapshot,
+            &PathBuf::from("test.txt"),
+        )
+        .unwrap();
+        let result_hash = *blake3::hash(&correct_encoded).as_bytes();
 
         let ops = vec![FileOp::ModifyFile {
             path: PathBuf::from("test.txt"),
-            base_blob,
+            base_snapshot: old_snapshot,
             operations: byte_ops,
             result_hash,
         }];
 
-        let result = apply_operations(cairn_dir, &files, &ops);
+        let result = apply_operations(cairn_dir, &files, &ops, &new_snapshot);
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("BLAKE3 hash mismatch"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("BLAKE3 hash mismatch")
+        );
     }
 
     #[test]
@@ -363,36 +438,62 @@ mod tests {
         files.insert(PathBuf::from("file1.txt"), content1.to_vec());
         files.insert(PathBuf::from("file2.txt"), content2.to_vec());
 
-        let base_blob1 = write_blob(cairn_dir, content1).unwrap();
-        let base_blob2 = write_blob(cairn_dir, content2).unwrap();
+        // Create old snapshot
+        let old_snapshot = create_snapshot(&files, cairn_dir).unwrap();
+
+        // Create new snapshot
+        let mut new_files = HashMap::new();
+        new_files.insert(PathBuf::from("file1.txt"), b"valid".to_vec());
+        new_files.insert(PathBuf::from("file2.txt"), b"not_wrong".to_vec());
+        let new_snapshot = create_snapshot(&new_files, cairn_dir).unwrap();
+
+        // Extract x-encoded content
+        let valid_encoded = crate::snapshot_vsf::extract_encoded_file(
+            cairn_dir,
+            &new_snapshot,
+            &PathBuf::from("file1.txt"),
+        )
+        .unwrap();
+        let not_wrong_encoded = crate::snapshot_vsf::extract_encoded_file(
+            cairn_dir,
+            &new_snapshot,
+            &PathBuf::from("file2.txt"),
+        )
+        .unwrap();
 
         // First op is valid, second op has wrong hash
         let ops = vec![
             FileOp::ModifyFile {
                 path: PathBuf::from("file1.txt"),
-                base_blob: base_blob1,
+                base_snapshot: old_snapshot,
                 operations: vec![ByteOp::Insert {
-                    content: b"valid".to_vec(),
+                    content: valid_encoded.clone(),
                 }],
-                result_hash: *blake3::hash(b"valid").as_bytes(),
+                result_hash: *blake3::hash(&valid_encoded).as_bytes(),
             },
             FileOp::ModifyFile {
                 path: PathBuf::from("file2.txt"),
-                base_blob: base_blob2,
+                base_snapshot: old_snapshot,
                 operations: vec![ByteOp::Insert {
                     content: b"wrong".to_vec(),
                 }],
-                result_hash: *blake3::hash(b"not_wrong").as_bytes(), // Wrong!
+                result_hash: *blake3::hash(&not_wrong_encoded).as_bytes(), // Wrong!
             },
         ];
 
-        let result = apply_operations(cairn_dir, &files, &ops);
+        let result = apply_operations(cairn_dir, &files, &ops, &new_snapshot);
 
         assert!(result.is_err());
 
         // Original files should be unchanged (atomicity)
-        assert_eq!(files.get(&PathBuf::from("file1.txt")), Some(&content1.to_vec()));
-        assert_eq!(files.get(&PathBuf::from("file2.txt")), Some(&content2.to_vec()));
+        assert_eq!(
+            files.get(&PathBuf::from("file1.txt")),
+            Some(&content1.to_vec())
+        );
+        assert_eq!(
+            files.get(&PathBuf::from("file2.txt")),
+            Some(&content2.to_vec())
+        );
     }
 
     #[test]
@@ -402,10 +503,31 @@ mod tests {
 
         // Binary data (not text)
         let old_binary = vec![0xFF, 0x00, 0xAB, 0xCD, 0xEF];
-        let base_blob = write_blob(cairn_dir, &old_binary).unwrap();
-
         let mut files = HashMap::new();
         files.insert(PathBuf::from("binary.dat"), old_binary.clone());
+
+        // Create old snapshot
+        let old_snapshot = create_snapshot(&files, cairn_dir).unwrap();
+
+        // Create new snapshot
+        let new_binary = vec![0xFF, 0x00, 0x12, 0x34, 0xCD, 0xEF];
+        let mut new_files = HashMap::new();
+        new_files.insert(PathBuf::from("binary.dat"), new_binary.clone());
+        let new_snapshot = create_snapshot(&new_files, cairn_dir).unwrap();
+
+        // Extract x-encoded (raw binary) content
+        let old_encoded = crate::snapshot_vsf::extract_encoded_file(
+            cairn_dir,
+            &old_snapshot,
+            &PathBuf::from("binary.dat"),
+        )
+        .unwrap();
+        let new_encoded = crate::snapshot_vsf::extract_encoded_file(
+            cairn_dir,
+            &new_snapshot,
+            &PathBuf::from("binary.dat"),
+        )
+        .unwrap();
 
         let byte_ops = vec![
             ByteOp::Copy { start: 0, len: 2 },
@@ -415,17 +537,16 @@ mod tests {
             ByteOp::Copy { start: 3, len: 2 },
         ];
 
-        let new_binary = vec![0xFF, 0x00, 0x12, 0x34, 0xCD, 0xEF];
-        let result_hash = *blake3::hash(&new_binary).as_bytes();
+        let result_hash = *blake3::hash(&new_encoded).as_bytes();
 
         let ops = vec![FileOp::ModifyFile {
             path: PathBuf::from("binary.dat"),
-            base_blob,
+            base_snapshot: old_snapshot,
             operations: byte_ops,
             result_hash,
         }];
 
-        let result = apply_operations(cairn_dir, &files, &ops).unwrap();
+        let result = apply_operations(cairn_dir, &files, &ops, &new_snapshot).unwrap();
 
         assert_eq!(result.get(&PathBuf::from("binary.dat")), Some(&new_binary));
     }

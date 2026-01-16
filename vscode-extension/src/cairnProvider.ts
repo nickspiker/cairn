@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { BinaryManager } from './binaryManager';
-import { runCairn } from './cairnUtils';
+import { runCairn, getActiveCargoRoot } from './cairnUtils';
 
 export interface PatchInfo {
     id: string;
@@ -13,11 +13,23 @@ export interface PatchInfo {
 export class CairnProvider implements vscode.TreeDataProvider<PatchTreeItem> {
     private _onDidChangeTreeData: vscode.EventEmitter<PatchTreeItem | undefined | null | void> = new vscode.EventEmitter<PatchTreeItem | undefined | null | void>();
     readonly onDidChangeTreeData: vscode.Event<PatchTreeItem | undefined | null | void> = this._onDidChangeTreeData.event;
+    private currentCargoRoot: string | undefined;
 
     constructor(private context: vscode.ExtensionContext, private binaryManager: BinaryManager) {}
 
     refresh(): void {
         this._onDidChangeTreeData.fire();
+    }
+
+    /**
+     * Refresh if the active Cargo root has changed
+     */
+    refreshIfCargoRootChanged(): void {
+        const newCargoRoot = getActiveCargoRoot();
+        if (newCargoRoot !== this.currentCargoRoot) {
+            this.currentCargoRoot = newCargoRoot;
+            this.refresh();
+        }
     }
 
     getTreeItem(element: PatchTreeItem): vscode.TreeItem {
@@ -34,12 +46,14 @@ export class CairnProvider implements vscode.TreeDataProvider<PatchTreeItem> {
     }
 
     async getPatches(): Promise<PatchInfo[]> {
-        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-        if (!workspaceFolder) {
+        const cargoRoot = getActiveCargoRoot();
+        if (!cargoRoot) {
             return [];
         }
 
-        const cairnDir = path.join(workspaceFolder.uri.fsPath, '.cairn');
+        this.currentCargoRoot = cargoRoot;
+        const cairnDir = path.join(cargoRoot, '.cairn');
+
         try {
             // Check if .cairn exists
             const fs = require('fs');
@@ -47,8 +61,8 @@ export class CairnProvider implements vscode.TreeDataProvider<PatchTreeItem> {
                 return [];
             }
 
-            // Run cairn list and parse output
-            const output = await runCairn(this.binaryManager, ['list']);
+            // Run cairn list in the active Cargo root
+            const output = await runCairn(this.binaryManager, ['list'], cargoRoot);
 
             // Parse the output
             // Format: "  #0   mnemonic-words-here (CURRENT, NEWEST)"

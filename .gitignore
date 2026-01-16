@@ -1,3 +1,4 @@
 /target
 .cairn/
 *.vsix
+release-v*/

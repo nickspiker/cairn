@@ -1,10 +1,9 @@
 //! Repository state management
 //!
-//! Tracks the current patch head and file tree state.
+//! Tracks the current patch and file tree state.
 //! State is persisted to `.cairn/state.vsf` using VSF encoding.
 
-use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 use vsf::{VsfBuilder, VsfSection, VsfType};
 
@@ -23,9 +22,9 @@ pub struct RepositoryState {
     /// patches[0] = first build, patches[n-1] = latest
     pub patches: Vec<String>,
 
-    /// Current file tree state (path → BLAKE3 hash)
-    /// Used for hardlink optimization during rollback
-    pub files: HashMap<PathBuf, Blake3Hash>,
+    /// Latest snapshot hash (complete workspace state in VSF)
+    /// This is the provenance hash of the snapshot VSF file
+    pub latest_snapshot: Blake3Hash,
 }
 
 impl RepositoryState {
@@ -34,20 +33,20 @@ impl RepositoryState {
         Self {
             head: String::new(),
             patches: Vec::new(),
-            files: HashMap::new(),
+            latest_snapshot: [0u8; 32],
         }
     }
 
     /// Encode state to VSF format
     ///
     /// VSF structure:
-    /// - metadata section: head patch ID
+    /// - metadata section: current patch ID + latest snapshot hash
     /// - patches section: chronological list of patch IDs
-    /// - files section: file paths with BLAKE3 hashes
     pub fn encode_vsf(&self) -> Result<Vec<u8>> {
         // 1. Metadata section
         let mut metadata_section = VsfSection::new("metadata");
-        metadata_section.add_field("head", VsfType::l(self.head.clone()));
+        metadata_section.add_field("current", VsfType::l(self.head.clone()));
+        metadata_section.add_field("snapshot", VsfType::hp(self.latest_snapshot.to_vec()));
 
         // 2. Patches section (insertion order)
         let mut patches_section = VsfSection::new("patches");
@@ -55,23 +54,10 @@ impl RepositoryState {
             patches_section.add_field(&format!("p{}", idx), VsfType::l(patch_id.clone()));
         }
 
-        // 3. Files section (path → hash)
-        let mut files_section = VsfSection::new("files");
-        for (idx, (path, hash)) in self.files.iter().enumerate() {
-            files_section.add_field_multi(
-                &format!("f{}", idx),
-                vec![
-                    VsfType::l(path.to_string_lossy().to_string()),
-                    VsfType::hp(hash.to_vec()),
-                ],
-            );
-        }
-
-        // 4. Build VSF file
+        // 3. Build VSF file
         let builder = VsfBuilder::new()
             .add_section_direct(metadata_section)
-            .add_section_direct(patches_section)
-            .add_section_direct(files_section);
+            .add_section_direct(patches_section);
 
         builder.build().map_err(|e| anyhow!(e))
     }
@@ -87,7 +73,7 @@ impl RepositoryState {
         // 2. Parse sections
         let mut head = String::new();
         let mut patches = Vec::new();
-        let mut files = HashMap::new();
+        let mut latest_snapshot = [0u8; 32];
 
         for field in &header.fields {
             // Skip empty sections
@@ -105,9 +91,14 @@ impl RepositoryState {
 
             match section.name.as_str() {
                 "metadata" => {
-                    if let Some(field) = section.get_field("head") {
+                    if let Some(field) = section.get_field("current") {
                         if let Some(VsfType::l(s)) = field.values.first() {
                             head = s.clone();
+                        }
+                    }
+                    if let Some(field) = section.get_field("snapshot") {
+                        if let Some(hash) = extract_hash(field.values.first().unwrap()) {
+                            latest_snapshot = hash;
                         }
                     }
                 }
@@ -127,21 +118,6 @@ impl RepositoryState {
                         }
                     }
                 }
-                "files" => {
-                    // Files stored as f0, f1, f2, ... with [path, hash] values
-                    for field in &section.fields {
-                        if field.values.len() >= 2 {
-                            // Extract path from first value
-                            if let Some(VsfType::l(path_str)) = field.values.first() {
-                                let path = PathBuf::from(path_str);
-                                // Extract hash from second value
-                                if let Some(hash) = extract_hash(&field.values[1]) {
-                                    files.insert(path, hash);
-                                }
-                            }
-                        }
-                    }
-                }
                 _ => {
                     // Unknown section, skip
                 }
@@ -151,7 +127,7 @@ impl RepositoryState {
         Ok(RepositoryState {
             head,
             patches,
-            files,
+            latest_snapshot,
         })
     }
 
@@ -174,10 +150,10 @@ impl RepositoryState {
     }
 
     /// Add a new patch to history
-    pub fn add_patch(&mut self, patch_id: String, new_files: HashMap<PathBuf, Blake3Hash>) {
+    pub fn add_patch(&mut self, patch_id: String, snapshot_hash: Blake3Hash) {
         self.patches.push(patch_id.clone());
         self.head = patch_id;
-        self.files = new_files;
+        self.latest_snapshot = snapshot_hash;
     }
 
     /// Get the latest patch ID
@@ -230,19 +206,15 @@ mod tests {
         let mut state = RepositoryState::new();
 
         let patch_id = "a3f8d9e1".to_string();
-        let mut files = HashMap::new();
-        files.insert(
-            PathBuf::from("src/main.rs"),
-            *blake3::hash(b"fn main() {}").as_bytes(),
-        );
+        let snapshot_hash = *blake3::hash(b"fake snapshot content").as_bytes();
 
-        state.add_patch(patch_id.clone(), files);
+        state.add_patch(patch_id.clone(), snapshot_hash);
 
         assert!(!state.is_empty());
         assert_eq!(state.head, patch_id);
         assert_eq!(state.latest(), Some(&patch_id));
         assert_eq!(state.patches.len(), 1);
-        assert_eq!(state.files.len(), 1);
+        assert_eq!(state.latest_snapshot, snapshot_hash);
     }
 
     #[test]
@@ -253,7 +225,7 @@ mod tests {
 
         assert_eq!(decoded.head, original.head);
         assert_eq!(decoded.patches, original.patches);
-        assert_eq!(decoded.files, original.files);
+        assert_eq!(decoded.latest_snapshot, original.latest_snapshot);
     }
 
     #[test]
@@ -261,24 +233,12 @@ mod tests {
         let mut state = RepositoryState::new();
 
         // Add first patch
-        let mut files1 = HashMap::new();
-        files1.insert(
-            PathBuf::from("src/main.rs"),
-            *blake3::hash(b"fn main() {}").as_bytes(),
-        );
-        state.add_patch("patch1".to_string(), files1.clone());
+        let snapshot1 = *blake3::hash(b"snapshot 1 content").as_bytes();
+        state.add_patch("patch1".to_string(), snapshot1);
 
         // Add second patch
-        let mut files2 = HashMap::new();
-        files2.insert(
-            PathBuf::from("src/main.rs"),
-            *blake3::hash(b"fn main() { println!(\"hi\"); }").as_bytes(),
-        );
-        files2.insert(
-            PathBuf::from("src/lib.rs"),
-            *blake3::hash(b"pub fn test() {}").as_bytes(),
-        );
-        state.add_patch("patch2".to_string(), files2);
+        let snapshot2 = *blake3::hash(b"snapshot 2 content").as_bytes();
+        state.add_patch("patch2".to_string(), snapshot2);
 
         // Roundtrip
         let encoded = state.encode_vsf().unwrap();
@@ -286,9 +246,7 @@ mod tests {
 
         assert_eq!(decoded.head, "patch2");
         assert_eq!(decoded.patches, vec!["patch1", "patch2"]);
-        assert_eq!(decoded.files.len(), 2);
-        assert!(decoded.files.contains_key(&PathBuf::from("src/main.rs")));
-        assert!(decoded.files.contains_key(&PathBuf::from("src/lib.rs")));
+        assert_eq!(decoded.latest_snapshot, snapshot2);
     }
 
     #[test]
@@ -297,7 +255,8 @@ mod tests {
 
         for i in 0..10 {
             let patch_id = format!("patch{}", i);
-            state.add_patch(patch_id, HashMap::new());
+            let snapshot = *blake3::hash(format!("snapshot {}", i).as_bytes()).as_bytes();
+            state.add_patch(patch_id, snapshot);
         }
 
         let encoded = state.encode_vsf().unwrap();

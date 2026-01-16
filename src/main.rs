@@ -7,16 +7,16 @@
 //! - Easy rollback to any successful build state
 
 mod apply;
-mod blob;
 mod decode;
 mod diff;
 mod encode;
 mod mnemonic;
 mod patch;
 mod snapshot;
+mod snapshot_vsf;
 mod state;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::fs;
@@ -114,11 +114,13 @@ fn cmd_init() -> Result<()> {
     // Create .cairn directory structure
     fs::create_dir(&cairn_dir).context("Failed to create .cairn directory")?;
     fs::create_dir(cairn_dir.join("patches")).context("Failed to create patches directory")?;
-    fs::create_dir(cairn_dir.join("blobs")).context("Failed to create blobs directory")?;
+    fs::create_dir(cairn_dir.join("snapshots")).context("Failed to create snapshots directory")?;
 
     // Create initial empty state
     let initial_state = state::RepositoryState::new();
-    initial_state.save(&cairn_dir).context("Failed to save initial state")?;
+    initial_state
+        .save(&cairn_dir)
+        .context("Failed to save initial state")?;
 
     println!("✓ Initialized cairn repository in .cairn/");
     println!("  Build your project with 'cargo build' to create snapshots");
@@ -130,12 +132,14 @@ fn cmd_list() -> Result<()> {
 
     // Check if initialized
     if !cairn_dir.exists() {
-        return Err(anyhow!("Not a cairn repository (no .cairn directory found)"));
+        return Err(anyhow!(
+            "Not a cairn repository (no .cairn directory found)"
+        ));
     }
 
     // Load repository state
-    let repo_state = state::RepositoryState::load(&cairn_dir)
-        .context("Failed to load repository state")?;
+    let repo_state =
+        state::RepositoryState::load(&cairn_dir).context("Failed to load repository state")?;
 
     if repo_state.is_empty() {
         println!("No patches yet - build your project to create the first one");
@@ -175,12 +179,14 @@ fn cmd_show(patch_id: &str) -> Result<()> {
 
     // Check if initialized
     if !cairn_dir.exists() {
-        return Err(anyhow!("Not a cairn repository (no .cairn directory found)"));
+        return Err(anyhow!(
+            "Not a cairn repository (no .cairn directory found)"
+        ));
     }
 
     // Load repository state
-    let repo_state = state::RepositoryState::load(&cairn_dir)
-        .context("Failed to load repository state")?;
+    let repo_state =
+        state::RepositoryState::load(&cairn_dir).context("Failed to load repository state")?;
 
     // Find patch by prefix match (supports both mnemonic and base64url)
     let full_patch_id = find_patch_by_id(&repo_state.patches, patch_id)?;
@@ -190,8 +196,7 @@ fn cmd_show(patch_id: &str) -> Result<()> {
     let patch_bytes = fs::read(&patch_path)
         .with_context(|| format!("Failed to read patch file: {:?}", patch_path))?;
 
-    let patch = patch::Patch::decode_vsf(&patch_bytes)
-        .context("Failed to decode patch")?;
+    let patch = patch::Patch::decode_vsf(&patch_bytes).context("Failed to decode patch")?;
 
     // Display patch information with mnemonic
     let mnemonic = mnemonic::patch_id_to_mnemonic(&full_patch_id, 5)
@@ -216,12 +221,14 @@ fn cmd_rollback(patch_id: &str) -> Result<()> {
 
     // Check if initialized
     if !cairn_dir.exists() {
-        return Err(anyhow!("Not a cairn repository (no .cairn directory found)"));
+        return Err(anyhow!(
+            "Not a cairn repository (no .cairn directory found)"
+        ));
     }
 
     // Load repository state
-    let mut repo_state = state::RepositoryState::load(&cairn_dir)
-        .context("Failed to load repository state")?;
+    let mut repo_state =
+        state::RepositoryState::load(&cairn_dir).context("Failed to load repository state")?;
 
     // Find patch by prefix match (supports both mnemonic and base64url)
     let target_patch_id = find_patch_by_id(&repo_state.patches, patch_id)?;
@@ -233,48 +240,13 @@ fn cmd_rollback(patch_id: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Apply patch operations to reconstruct the target state
-    // For Week 1, we'll use the simple approach: rebuild from scratch
-    // TODO: For Week 2+, implement incremental rollback
+    // TODO: Implement rollback with snapshot-based approach
+    // For now, rollback is temporarily disabled until we implement
+    // proper snapshot-per-patch storage in state
 
-    // Start with empty file tree
-    let mut current_files = HashMap::new();
-
-    // Find all patches up to and including the target
-    let target_idx = repo_state
-        .patches
-        .iter()
-        .position(|id| id == &target_patch_id)
-        .unwrap();
-
-    // Apply all patches in order up to target
-    for patch_id in &repo_state.patches[..=target_idx] {
-        let patch_path = cairn_dir.join("patches").join(patch_id);
-        let patch_bytes = fs::read(&patch_path)?;
-        let patch = patch::Patch::decode_vsf(&patch_bytes)?;
-
-        current_files = apply::apply_operations(&cairn_dir, &current_files, &patch.operations)?;
-    }
-
-    // Write files to working directory
-    // TODO: Use hardlinks for unchanged files
-    for (path, content) in &current_files {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, content)?;
-    }
-
-    // Update repository state
-    repo_state.head = target_patch_id.clone();
-    repo_state.save(&cairn_dir)?;
-
-    let mnemonic = mnemonic::patch_id_to_mnemonic(&target_patch_id, 5)
-        .unwrap_or_else(|_| format!("{}...", &target_patch_id[..16]));
-    println!("✓ Rolled back to patch {}", mnemonic);
-    println!("  {} files updated", current_files.len());
-
-    Ok(())
+    return Err(anyhow!(
+        "Rollback temporarily disabled - being refactored for snapshot-based storage"
+    ));
 }
 
 fn cmd_snapshot(message: &str) -> Result<()> {
@@ -282,7 +254,9 @@ fn cmd_snapshot(message: &str) -> Result<()> {
 
     // Check if initialized
     if !cairn_dir.exists() {
-        return Err(anyhow!("Not a cairn repository (no .cairn directory found)"));
+        return Err(anyhow!(
+            "Not a cairn repository (no .cairn directory found)"
+        ));
     }
 
     // Create fake build hash (in real implementation, this comes from cargo build output)
@@ -316,5 +290,8 @@ fn find_patch_by_id(patches: &[String], id: &str) -> Result<String> {
         }
     }
 
-    Err(anyhow!("Patch not found: {}. Use full 5-word mnemonic or full base64url hash.", id))
+    Err(anyhow!(
+        "Patch not found: {}. Use full 5-word mnemonic or full base64url hash.",
+        id
+    ))
 }
