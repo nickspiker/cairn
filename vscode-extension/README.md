@@ -1,6 +1,10 @@
 # Cairn VSCode Extension
 
+**⚠️ EXPERIMENTAL - v0.0.0 - NOT PRODUCTION READY**
+
 Automatic patch creation on successful cargo builds with visual timeline.
+
+> **Warning:** This extension has known stability issues. Do not use on critical projects. See the main Cairn README for details.
 
 ## Features
 

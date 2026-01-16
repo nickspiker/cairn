@@ -1,8 +1,13 @@
 {
   "name": "cairn",
   "displayName": "Cairn",
-  "description": "Patch-based version control for successful cargo builds",
+  "description": "⚠️ EXPERIMENTAL - Patch-based version control for successful cargo builds",
   "version": "0.0.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nickspiker/cairn"
+  },
+  "license": "MIT OR Apache-2.0",
   "publisher": "fractaldecoder",
   "icon": "resources/cairn-icon.png",
   "engines": {
