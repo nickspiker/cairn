@@ -1,229 +1,316 @@
 import * as vscode from 'vscode';
-import { CairnProvider } from './cairnProvider';
-import { BuildCommandsProvider } from './buildCommandsProvider';
-import { BinaryManager } from './binaryManager';
-import { runCairn } from './cairnUtils';
-import { exec } from 'child_process';
-import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
 
-const execAsync = promisify(exec);
+let outputChannel: vscode.OutputChannel;
 
-let cairnProvider: CairnProvider;
-let buildCommandsProvider: BuildCommandsProvider;
-let binaryManager: BinaryManager;
-let cairnTreeView: vscode.TreeView<any>;
+class CairnTreeItem extends vscode.TreeItem {
+    constructor(
+        public readonly label: string,
+        public readonly collapsibleState: vscode.TreeItemCollapsibleState,
+        public readonly command?: vscode.Command,
+        public readonly contextValue?: string
+    ) {
+        super(label, collapsibleState);
+    }
+}
 
-export function activate(context: vscode.ExtensionContext) {
-    console.log('Cairn extension activated');
+class CairnTreeProvider implements vscode.TreeDataProvider<CairnTreeItem> {
+    private _onDidChangeTreeData: vscode.EventEmitter<CairnTreeItem | undefined | null | void> = new vscode.EventEmitter<CairnTreeItem | undefined | null | void>();
+    readonly onDidChangeTreeData: vscode.Event<CairnTreeItem | undefined | null | void> = this._onDidChangeTreeData.event;
 
-    // Initialize binary manager
-    binaryManager = new BinaryManager(context);
+    refresh(): void {
+        outputChannel.appendLine('[REFRESH] Tree view refresh triggered');
+        this._onDidChangeTreeData.fire();
+    }
 
-    // Initialize cairn provider (tree view)
-    cairnProvider = new CairnProvider(context, binaryManager);
-    cairnTreeView = vscode.window.createTreeView('cairnHistory', {
-        treeDataProvider: cairnProvider
-    });
+    getTreeItem(element: CairnTreeItem): vscode.TreeItem {
+        return element;
+    }
 
-    // Initialize build commands provider
-    buildCommandsProvider = new BuildCommandsProvider();
-    vscode.window.registerTreeDataProvider('cairnBuildCommands', buildCommandsProvider);
+    getChildren(element?: CairnTreeItem): CairnTreeItem[] {
+        outputChannel.appendLine(`[TREE] getChildren called for: ${element?.label || 'root'}`);
+        if (!element) {
+            // Root level - show Commands and Patches sections
+            return [
+                new CairnTreeItem('Commands', vscode.TreeItemCollapsibleState.Expanded, undefined, 'commands'),
+                new CairnTreeItem('Patches', vscode.TreeItemCollapsibleState.Expanded, undefined, 'patches'),
+            ];
+        } else if (element.contextValue === 'commands') {
+            // Build commands
+            return [
+                new CairnTreeItem('▶ Run', vscode.TreeItemCollapsibleState.None, {
+                    command: 'cairn.run',
+                    title: 'Run',
+                }),
+                new CairnTreeItem('▶ Run (Release)', vscode.TreeItemCollapsibleState.None, {
+                    command: 'cairn.runRelease',
+                    title: 'Run Release',
+                }),
+                new CairnTreeItem('🔨 Build', vscode.TreeItemCollapsibleState.None, {
+                    command: 'cairn.build',
+                    title: 'Build',
+                }),
+                new CairnTreeItem('🔨 Build (Release)', vscode.TreeItemCollapsibleState.None, {
+                    command: 'cairn.buildRelease',
+                    title: 'Build Release',
+                }),
+                new CairnTreeItem('✓ Check', vscode.TreeItemCollapsibleState.None, {
+                    command: 'cairn.check',
+                    title: 'Check',
+                }),
+                new CairnTreeItem('🧪 Test', vscode.TreeItemCollapsibleState.None, {
+                    command: 'cairn.test',
+                    title: 'Test',
+                }),
+                new CairnTreeItem('🗑 Clean', vscode.TreeItemCollapsibleState.None, {
+                    command: 'cairn.clean',
+                    title: 'Clean',
+                }),
+            ];
+        } else if (element.contextValue === 'patches') {
+            // List patches from .cairn/patches directory
+            outputChannel.appendLine('[PATCHES] Loading patches list');
+            return this.getPatches();
+        }
+        return [];
+    }
 
-    // Register commands
-    context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.init', async () => {
-            try {
-                await runCairn(binaryManager, ['init']);
-                cairnProvider.refresh();
-                vscode.window.showInformationMessage('✓ Cairn initialized');
-            } catch (error) {
-                vscode.window.showErrorMessage(`Failed to initialize cairn: ${error}`);
-            }
-        })
-    );
+    private getPatches(): CairnTreeItem[] {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) {
+            outputChannel.appendLine('[PATCHES] No workspace folders');
+            return [];
+        }
 
-    context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.list', async () => {
-            try {
-                const output = await runCairn(binaryManager, ['list']);
-                const outputChannel = vscode.window.createOutputChannel('Cairn');
-                outputChannel.clear();
-                outputChannel.appendLine(output);
-                outputChannel.show();
-            } catch (error) {
-                vscode.window.showErrorMessage(`Failed to list patches: ${error}`);
-            }
-        })
-    );
+        const cairnDir = path.join(workspaceFolders[0].uri.fsPath, '.cairn', 'patches');
+        outputChannel.appendLine(`[PATCHES] Reading from: ${cairnDir}`);
 
-    context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.rollback', async (patchItem) => {
-            if (patchItem && patchItem.patchId) {
-                await rollbackToPatch(patchItem.patchId);
-            } else {
-                // Show quick pick if no patch selected
-                const patches = await cairnProvider.getPatches();
-                if (patches.length === 0) {
-                    vscode.window.showInformationMessage('No patches available');
-                    return;
-                }
+        if (!fs.existsSync(cairnDir)) {
+            outputChannel.appendLine('[PATCHES] Directory does not exist');
+            return [new CairnTreeItem('No patches yet', vscode.TreeItemCollapsibleState.None)];
+        }
 
-                const items = patches.map(p => ({
-                    label: p.mnemonic,
-                    description: p.marker,
-                    patchId: p.id
-                }));
+        try {
+            const files = fs.readdirSync(cairnDir, { withFileTypes: true });
+            outputChannel.appendLine(`[PATCHES] Found ${files.length} files`);
 
-                const selected = await vscode.window.showQuickPick(items, {
-                    placeHolder: 'Select a patch to rollback to'
+            const patches = files
+                .filter(dirent => dirent.isFile())
+                .map(dirent => dirent.name)
+                .sort()
+                .reverse() // Most recent first
+                .map(file => {
+                    return new CairnTreeItem(
+                        `📦 ${file}`,
+                        vscode.TreeItemCollapsibleState.None,
+                        {
+                            command: 'cairn.showPatch',
+                            title: 'Show Patch',
+                            arguments: [file]
+                        }
+                    );
                 });
 
-                if (selected) {
-                    await rollbackToPatch(selected.patchId);
-                }
-            }
-        })
-    );
+            outputChannel.appendLine(`[PATCHES] Returning ${patches.length} patch items`);
+            return patches.length > 0 ? patches : [new CairnTreeItem('No patches yet', vscode.TreeItemCollapsibleState.None)];
+        } catch (err) {
+            outputChannel.appendLine(`[PATCHES] Error: ${err}`);
+            return [new CairnTreeItem('Error reading patches', vscode.TreeItemCollapsibleState.None)];
+        }
+    }
+}
 
-    context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.showPatch', async (patchItem) => {
-            if (patchItem && patchItem.patchId) {
-                await showPatchDetails(patchItem.patchId);
-            }
-        })
-    );
+export function activate(context: vscode.ExtensionContext) {
+    outputChannel = vscode.window.createOutputChannel('Cairn');
+    outputChannel.appendLine('=== Cairn extension activated ===');
+    outputChannel.show();
 
+    // Create tree view in sidebar
+    const treeProvider = new CairnTreeProvider();
+    outputChannel.appendLine('[INIT] Creating tree view');
+    vscode.window.createTreeView('cairnView', {
+        treeDataProvider: treeProvider
+    });
+    outputChannel.appendLine('[INIT] Tree view created');
+
+    // Register refresh command
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.refresh', () => {
-            cairnProvider.refresh();
+            outputChannel.appendLine('[CMD] Refresh command called');
+            treeProvider.refresh();
+        })
+    );
+
+    // Register build commands
+    context.subscriptions.push(
+        vscode.commands.registerCommand('cairn.run', async () => {
+            outputChannel.appendLine('[CMD] RUN command triggered');
+            const task = new vscode.Task(
+                { type: 'shell' },
+                vscode.TaskScope.Workspace,
+                'Cairn Run',
+                'cairn',
+                new vscode.ShellExecution('cargo cairn run')
+            );
+            task.presentationOptions = {
+                reveal: vscode.TaskRevealKind.Always,
+                panel: vscode.TaskPanelKind.Dedicated
+            };
+            outputChannel.appendLine('[CMD] Executing run task');
+            await vscode.tasks.executeTask(task);
+            outputChannel.appendLine('[CMD] Run task started');
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.runBuildCommand', async (buildCommandItem) => {
-            if (buildCommandItem && buildCommandItem.cargoCommand) {
-                await runBuildCommand(buildCommandItem.cargoCommand);
-            }
+        vscode.commands.registerCommand('cairn.runRelease', async () => {
+            outputChannel.appendLine('[CMD] RUN RELEASE command triggered');
+            const task = new vscode.Task(
+                { type: 'shell' },
+                vscode.TaskScope.Workspace,
+                'Cairn Run (Release)',
+                'cairn',
+                new vscode.ShellExecution('cargo cairn run --release')
+            );
+            task.presentationOptions = {
+                reveal: vscode.TaskRevealKind.Always,
+                panel: vscode.TaskPanelKind.Dedicated
+            };
+            await vscode.tasks.executeTask(task);
+            outputChannel.appendLine('[CMD] Run release task started');
         })
     );
 
-    // Watch for .cairn/state.vsf changes in all workspace folders
-    const stateWatcher = vscode.workspace.createFileSystemWatcher('**/.cairn/state.vsf');
-    stateWatcher.onDidChange(() => cairnProvider.refresh());
-    stateWatcher.onDidCreate(() => cairnProvider.refresh());
-    stateWatcher.onDidDelete(() => cairnProvider.refresh());
-    context.subscriptions.push(stateWatcher);
-
-    // Refresh patch history when switching between files in different projects
     context.subscriptions.push(
-        vscode.window.onDidChangeActiveTextEditor(() => {
-            cairnProvider.refreshIfCargoRootChanged();
+        vscode.commands.registerCommand('cairn.build', async () => {
+            outputChannel.appendLine('[CMD] BUILD command triggered');
+            const task = new vscode.Task(
+                { type: 'shell' },
+                vscode.TaskScope.Workspace,
+                'Cairn Build',
+                'cairn',
+                new vscode.ShellExecution('cargo cairn build')
+            );
+            task.presentationOptions = {
+                reveal: vscode.TaskRevealKind.Always,
+                panel: vscode.TaskPanelKind.Dedicated
+            };
+            outputChannel.appendLine('[CMD] Executing build task');
+            await vscode.tasks.executeTask(task);
+            outputChannel.appendLine('[CMD] Build task started, scheduling refresh');
+            // Refresh patches after build completes
+            setTimeout(() => {
+                outputChannel.appendLine('[CMD] Refreshing after build timeout');
+                treeProvider.refresh();
+            }, 1000);
         })
     );
 
-    // Initial refresh
-    cairnProvider.refresh();
+    context.subscriptions.push(
+        vscode.commands.registerCommand('cairn.buildRelease', async () => {
+            outputChannel.appendLine('[CMD] BUILD RELEASE command triggered');
+            const task = new vscode.Task(
+                { type: 'shell' },
+                vscode.TaskScope.Workspace,
+                'Cairn Build (Release)',
+                'cairn',
+                new vscode.ShellExecution('cargo cairn build --release')
+            );
+            task.presentationOptions = {
+                reveal: vscode.TaskRevealKind.Always,
+                panel: vscode.TaskPanelKind.Dedicated
+            };
+            await vscode.tasks.executeTask(task);
+            outputChannel.appendLine('[CMD] Build release task started, scheduling refresh');
+            setTimeout(() => treeProvider.refresh(), 1000);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('cairn.check', async () => {
+            outputChannel.appendLine('[CMD] CHECK command triggered');
+            const task = new vscode.Task(
+                { type: 'shell' },
+                vscode.TaskScope.Workspace,
+                'Cairn Check',
+                'cairn',
+                new vscode.ShellExecution('cargo cairn check')
+            );
+            task.presentationOptions = {
+                reveal: vscode.TaskRevealKind.Always,
+                panel: vscode.TaskPanelKind.Dedicated
+            };
+            await vscode.tasks.executeTask(task);
+            outputChannel.appendLine('[CMD] Check task started');
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('cairn.test', async () => {
+            outputChannel.appendLine('[CMD] TEST command triggered');
+            const task = new vscode.Task(
+                { type: 'shell' },
+                vscode.TaskScope.Workspace,
+                'Cairn Test',
+                'cairn',
+                new vscode.ShellExecution('cargo cairn test')
+            );
+            task.presentationOptions = {
+                reveal: vscode.TaskRevealKind.Always,
+                panel: vscode.TaskPanelKind.Dedicated
+            };
+            await vscode.tasks.executeTask(task);
+            outputChannel.appendLine('[CMD] Test task started, scheduling refresh');
+            setTimeout(() => treeProvider.refresh(), 1000);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('cairn.clean', async () => {
+            outputChannel.appendLine('[CMD] CLEAN command triggered');
+            const task = new vscode.Task(
+                { type: 'shell' },
+                vscode.TaskScope.Workspace,
+                'Cairn Clean',
+                'cairn',
+                new vscode.ShellExecution('cargo cairn clean')
+            );
+            task.presentationOptions = {
+                reveal: vscode.TaskRevealKind.Always,
+                panel: vscode.TaskPanelKind.Dedicated
+            };
+            await vscode.tasks.executeTask(task);
+            outputChannel.appendLine('[CMD] Clean task started');
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('cairn.showPatch', async (patchName: string) => {
+            outputChannel.appendLine(`[CMD] SHOW PATCH command triggered for: ${patchName}`);
+            const task = new vscode.Task(
+                { type: 'shell' },
+                vscode.TaskScope.Workspace,
+                'Cairn Show Patch',
+                'cairn',
+                new vscode.ShellExecution(`cargo cairn show ${patchName}`)
+            );
+            task.presentationOptions = {
+                reveal: vscode.TaskRevealKind.Always,
+                panel: vscode.TaskPanelKind.Dedicated
+            };
+            await vscode.tasks.executeTask(task);
+            outputChannel.appendLine('[CMD] Show patch task started');
+        })
+    );
+
+    outputChannel.appendLine('[INIT] All commands registered');
+    outputChannel.appendLine('=== Cairn extension ready ===');
 }
 
 export function deactivate() {
-    // Cleanup if needed
-}
-
-async function rollbackToPatch(patchId: string): Promise<void> {
-    try {
-        await runCairn(binaryManager, ['rollback', patchId]);
-        cairnProvider.refresh();
-        vscode.window.showInformationMessage(`✓ Rolled back to ${patchId}`);
-    } catch (error) {
-        vscode.window.showErrorMessage(`Failed to rollback: ${error}`);
-    }
-}
-
-async function showPatchDetails(patchId: string): Promise<void> {
-    try {
-        const output = await runCairn(binaryManager, ['show', patchId]);
-        const outputChannel = vscode.window.createOutputChannel('Cairn');
-        outputChannel.clear();
-        outputChannel.appendLine(output);
-        outputChannel.show();
-    } catch (error) {
-        vscode.window.showErrorMessage(`Failed to show patch: ${error}`);
-    }
-}
-
-async function runBuildCommand(cargoCommand: string): Promise<void> {
-    // Use the active editor's workspace folder, or fall back to first workspace
-    const activeEditor = vscode.window.activeTextEditor;
-    let workspaceFolder = activeEditor
-        ? vscode.workspace.getWorkspaceFolder(activeEditor.document.uri)
-        : undefined;
-
-    if (!workspaceFolder) {
-        workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-    }
-
-    if (!workspaceFolder) {
-        vscode.window.showErrorMessage('No workspace folder open');
-        return;
-    }
-
-    try {
-        // Ensure cargo-cairn is installed (downloads from GitHub if needed)
-        await binaryManager.ensureCargoCairnInstalled();
-
-        // Show output in dedicated output channel
-        const outputChannel = vscode.window.createOutputChannel('Cairn Build');
-        outputChannel.clear();
-        outputChannel.show();
-
-        outputChannel.appendLine(`Running: cargo cairn ${cargoCommand}\n`);
-
-        // Run cargo cairn command
-        const { stdout, stderr } = await execAsync(`cargo cairn ${cargoCommand}`, {
-            cwd: workspaceFolder.uri.fsPath
-        });
-
-        if (stdout) {
-            outputChannel.appendLine(stdout);
-        }
-        if (stderr) {
-            outputChannel.appendLine(stderr);
-        }
-
-        // Refresh the patch history after build
-        cairnProvider.refresh();
-
-        // Wait a bit for the tree to update, then select the head patch
-        setTimeout(async () => {
-            const patches = await cairnProvider.getPatches();
-            const headPatch = patches.find(p => p.marker.includes('CURRENT'));
-            if (headPatch && cairnTreeView) {
-                const items = await cairnProvider.getChildren();
-                const headItem = items.find(item => item.patchId === headPatch.id);
-                if (headItem) {
-                    cairnTreeView.reveal(headItem, { select: true, focus: false });
-                }
-            }
-        }, 100);
-
-        vscode.window.showInformationMessage(`✓ cargo cairn ${cargoCommand} completed`);
-    } catch (error: any) {
-        const outputChannel = vscode.window.createOutputChannel('Cairn Build');
-        outputChannel.appendLine(`Error running cargo cairn ${cargoCommand}:`);
-        outputChannel.appendLine('');
-        if (error.stdout) {
-            outputChannel.appendLine('STDOUT:');
-            outputChannel.appendLine(error.stdout);
-        }
-        if (error.stderr) {
-            outputChannel.appendLine('STDERR:');
-            outputChannel.appendLine(error.stderr);
-        }
-        if (error.message) {
-            outputChannel.appendLine('ERROR MESSAGE:');
-            outputChannel.appendLine(error.message);
-        }
-        outputChannel.show();
-        vscode.window.showErrorMessage(`Failed to run cargo cairn ${cargoCommand}`);
+    if (outputChannel) {
+        outputChannel.appendLine('=== Cairn extension deactivated ===');
+        outputChannel.dispose();
     }
 }

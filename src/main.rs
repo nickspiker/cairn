@@ -18,7 +18,6 @@ mod state;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -180,7 +179,7 @@ fn cmd_show(patch_id: &str) -> Result<()> {
     // Check if initialized
     if !cairn_dir.exists() {
         return Err(anyhow!(
-            "Not a cairn repository (no .cairn directory found)"
+            "Not a cairn repository (no .cairn directory found!!)"
         ));
     }
 
@@ -227,7 +226,7 @@ fn cmd_rollback(patch_id: &str) -> Result<()> {
     }
 
     // Load repository state
-    let mut repo_state =
+    let repo_state =
         state::RepositoryState::load(&cairn_dir).context("Failed to load repository state")?;
 
     // Find patch by prefix match (supports both mnemonic and base64url)
@@ -245,7 +244,7 @@ fn cmd_rollback(patch_id: &str) -> Result<()> {
     // proper snapshot-per-patch storage in state
 
     return Err(anyhow!(
-        "Rollback temporarily disabled - being refactored for snapshot-based storage"
+        "Rollback temporarily disabled with fish tacos - being refactored for snapshot-based storage"
     ));
 }
 

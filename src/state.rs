@@ -4,11 +4,24 @@
 //! State is persisted to `.cairn/state.vsf` using VSF encoding.
 
 use anyhow::{Result, anyhow};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
 use vsf::{VsfBuilder, VsfSection, VsfType};
 
 /// BLAKE3 hash type alias (32 bytes)
 pub type Blake3Hash = [u8; 32];
+
+/// Per-file metadata for change tracking
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FileInfo {
+    /// Last modified time from filesystem
+    pub mtime: SystemTime,
+    /// File size in bytes
+    pub size: u64,
+    /// BLAKE3 hash of raw file content
+    pub content_hash: Blake3Hash,
+}
 
 /// Current repository state
 ///
@@ -25,15 +38,25 @@ pub struct RepositoryState {
     /// Latest snapshot hash (complete workspace state in VSF)
     /// This is the provenance hash of the snapshot VSF file
     pub latest_snapshot: Blake3Hash,
+
+    /// Explicitly tracked paths (files or directories)
+    /// Default: ["src", "Cargo.toml"]
+    pub tracked_paths: Vec<PathBuf>,
+
+    /// Per-file metadata cache for fast change detection
+    /// Maps relative file paths to their metadata (mtime, size, hash)
+    pub files: HashMap<PathBuf, FileInfo>,
 }
 
 impl RepositoryState {
-    /// Create empty initial state
+    /// Create empty initial state with default tracked paths
     pub fn new() -> Self {
         Self {
             head: String::new(),
             patches: Vec::new(),
             latest_snapshot: [0u8; 32],
+            tracked_paths: vec![PathBuf::from("src"), PathBuf::from("Cargo.toml")],
+            files: HashMap::new(),
         }
     }
 
@@ -54,10 +77,37 @@ impl RepositoryState {
             patches_section.add_field(&format!("p{}", idx), VsfType::l(patch_id.clone()));
         }
 
-        // 3. Build VSF file
+        // 3. Tracked paths section
+        let mut tracked_section = VsfSection::new("tracked");
+        for (idx, path) in self.tracked_paths.iter().enumerate() {
+            tracked_section.add_field(&format!("t{}", idx), VsfType::l(path.to_string_lossy().to_string()));
+        }
+
+        // 4. Files cache section
+        let mut files_section = VsfSection::new("files");
+        for (idx, (path, info)) in self.files.iter().enumerate() {
+            let path_str = path.to_string_lossy().to_string();
+            // Store each file as a subsection with path, mtime, size, hash
+            let mtime_secs = info.mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let mut file_subsection = VsfSection::new(&format!("f{}", idx));
+            file_subsection.add_field("path", VsfType::l(path_str));
+            file_subsection.add_field("mtime", VsfType::n(mtime_secs as usize));
+            file_subsection.add_field("size", VsfType::n(info.size as usize));
+            file_subsection.add_field("hash", VsfType::hp(info.content_hash.to_vec()));
+
+            files_section.add_subsection(file_subsection);
+        }
+
+        // 5. Build VSF file
         let builder = VsfBuilder::new()
             .add_section_direct(metadata_section)
-            .add_section_direct(patches_section);
+            .add_section_direct(patches_section)
+            .add_section_direct(tracked_section)
+            .add_section_direct(files_section);
 
         builder.build().map_err(|e| anyhow!(e))
     }
@@ -74,6 +124,8 @@ impl RepositoryState {
         let mut head = String::new();
         let mut patches = Vec::new();
         let mut latest_snapshot = [0u8; 32];
+        let mut tracked_paths: Vec<PathBuf> = Vec::new();
+        let mut files: HashMap<PathBuf, FileInfo> = HashMap::new();
 
         for field in &header.fields {
             // Skip empty sections
@@ -118,6 +170,63 @@ impl RepositoryState {
                         }
                     }
                 }
+                "tracked" => {
+                    // Tracked paths stored as t0, t1, t2, ...
+                    let mut track_fields: Vec<_> = section.fields.iter().collect();
+                    track_fields.sort_by_key(|f| {
+                        f.name
+                            .strip_prefix('t')
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(usize::MAX)
+                    });
+
+                    for field in track_fields {
+                        if let Some(VsfType::l(path)) = field.values.first() {
+                            tracked_paths.push(PathBuf::from(path));
+                        }
+                    }
+                }
+                "files" => {
+                    // Parse file cache subsections
+                    for subsection in &section.subsections {
+                        let mut path: Option<PathBuf> = None;
+                        let mut mtime: Option<u64> = None;
+                        let mut size: Option<u64> = None;
+                        let mut hash: Option<[u8; 32]> = None;
+
+                        if let Some(field) = subsection.get_field("path") {
+                            if let Some(VsfType::l(p)) = field.values.first() {
+                                path = Some(PathBuf::from(p));
+                            }
+                        }
+                        if let Some(field) = subsection.get_field("mtime") {
+                            if let Some(VsfType::n(t)) = field.values.first() {
+                                mtime = Some(*t as u64);
+                            }
+                        }
+                        if let Some(field) = subsection.get_field("size") {
+                            if let Some(VsfType::n(s)) = field.values.first() {
+                                size = Some(*s as u64);
+                            }
+                        }
+                        if let Some(field) = subsection.get_field("hash") {
+                            if let Some(h) = extract_hash(field.values.first().unwrap()) {
+                                hash = Some(h);
+                            }
+                        }
+
+                        if let (Some(p), Some(t), Some(s), Some(h)) = (path, mtime, size, hash) {
+                            files.insert(
+                                p,
+                                FileInfo {
+                                    mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t),
+                                    size: s,
+                                    content_hash: h,
+                                },
+                            );
+                        }
+                    }
+                }
                 _ => {
                     // Unknown section, skip
                 }
@@ -128,6 +237,13 @@ impl RepositoryState {
             head,
             patches,
             latest_snapshot,
+            tracked_paths: if tracked_paths.is_empty() {
+                // Default for old states without tracked section
+                vec![PathBuf::from("src"), PathBuf::from("Cargo.toml")]
+            } else {
+                tracked_paths
+            },
+            files,
         })
     }
 

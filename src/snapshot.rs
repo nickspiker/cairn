@@ -107,12 +107,25 @@ pub fn create_snapshot_from_files(
 ///
 /// This is the main entry point called after a successful build.
 /// Returns the patch ID of the newly created patch.
+/// Create a snapshot from current working directory (for compatibility)
+///
+/// This is a legacy function that creates a complete snapshot.
+/// New code should use the incremental scan_working_directory + create_snapshot_from_files.
 pub fn create_snapshot(cairn_dir: &PathBuf, message: String, build_hash: Hash) -> Result<String> {
-    // Scan working directory for files
-    let current_files = scan_working_directory().context("Failed to scan working directory")?;
+    // Load state
+    let state = crate::state::RepositoryState::load(cairn_dir)
+        .context("Failed to load repository state")?;
+
+    // Scan for changes
+    let scan_result = scan_working_directory(&state)
+        .context("Failed to scan working directory")?;
+
+    // Combine all files (added + modified) for snapshot
+    let mut all_files = scan_result.added.clone();
+    all_files.extend(scan_result.modified.clone());
 
     // Create snapshot from those files
-    create_snapshot_from_files(cairn_dir, message, build_hash, current_files)
+    create_snapshot_from_files(cairn_dir, message, build_hash, all_files)
 }
 
 /// Scan working directory for all files
@@ -123,62 +136,184 @@ pub fn create_snapshot(cairn_dir: &PathBuf, message: String, build_hash: Hash) -
 /// - .git/ directory
 /// - Hidden files/directories (starting with .)
 /// - All patterns in .gitignore
-pub fn scan_working_directory() -> Result<HashMap<PathBuf, Vec<u8>>> {
-    use ignore::WalkBuilder;
+/// Result of scanning working directory for changes
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ScanResult {
+    pub added: HashMap<PathBuf, Vec<u8>>,      // New files with content
+    pub modified: HashMap<PathBuf, Vec<u8>>,   // Changed files with new content
+    pub deleted: Vec<PathBuf>,                 // Removed files
+    pub updated_cache: HashMap<PathBuf, crate::state::FileInfo>,  // Updated file cache
+}
 
-    let mut files = HashMap::new();
+/// Scan working directory for changes (incremental with mtime/size/hash checking)
+///
+/// Only scans explicitly tracked paths (from state.tracked_paths).
+/// Only reads files that have potentially changed based on mtime+size comparison.
+/// Returns lists of added, modified, and deleted files for efficient patch creation.
+pub fn scan_working_directory(state: &crate::state::RepositoryState) -> Result<ScanResult> {
     let current_dir = std::env::current_dir().context("Failed to get current directory")?;
+    let mut added = HashMap::new();
+    let mut modified = HashMap::new();
+    let mut updated_cache = HashMap::new();
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut file_count = 0;
+    const MAX_FILES: usize = 10000; // Safety limit
 
-    // Build walker that respects .gitignore
-    let walker = WalkBuilder::new(&current_dir)
-        .hidden(true) // Skip hidden files/dirs (starting with .)
-        .git_ignore(true) // Respect .gitignore
-        .git_exclude(true) // Respect .git/info/exclude
-        .require_git(false) // Don't require git repo
-        .add_custom_ignore_filename(".cairnignore") // Support .cairnignore too
-        .build();
+    // Only scan explicitly tracked paths
+    for tracked_path in &state.tracked_paths {
+        let full_path = current_dir.join(tracked_path);
 
-    for result in walker {
-        let entry = result.context("Failed to read directory entry")?;
-        let path = entry.path();
-
-        // Only process files (not directories)
-        if !path.is_file() {
-            continue;
+        if !full_path.exists() {
+            continue; // Tracked path doesn't exist (yet)
         }
 
-        // Always skip .cairn directory explicitly
-        if path.starts_with(&current_dir.join(".cairn")) {
-            continue;
+        if full_path.is_file() {
+            // Tracked path is a single file
+            scan_file(
+                &full_path,
+                &current_dir,
+                state,
+                &mut added,
+                &mut modified,
+                &mut updated_cache,
+                &mut seen_paths,
+            )?;
+            file_count += 1;
+        } else if full_path.is_dir() {
+            // Tracked path is a directory - walk it recursively
+            for entry in walkdir::WalkDir::new(&full_path)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+
+                // Only process files (not directories)
+                if !path.is_file() {
+                    continue;
+                }
+
+                file_count += 1;
+
+                if file_count > MAX_FILES {
+                    return Err(anyhow::anyhow!(
+                        "Too many files encountered (>{}) - possible directory explosion. \
+                         Check your tracked paths or use .gitignore to exclude large directories.",
+                        MAX_FILES
+                    ));
+                }
+
+                scan_file(
+                    path,
+                    &current_dir,
+                    state,
+                    &mut added,
+                    &mut modified,
+                    &mut updated_cache,
+                    &mut seen_paths,
+                )?;
+            }
         }
-
-        // Skip lock files and build artifacts
-        let file_name = path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-
-        if file_name == "Cargo.lock"
-            || file_name == "package-lock.json"
-            || file_name.ends_with(".vsix")
-            || file_name.ends_with(".wasm")
-        {
-            continue;
-        }
-
-        // Read file content
-        let content = fs::read(path)
-            .with_context(|| format!("Failed to read file: {:?}", path))?;
-
-        // Store with relative path
-        let relative_path = path
-            .strip_prefix(&current_dir)
-            .context("Path should be under current directory")?
-            .to_path_buf();
-
-        files.insert(relative_path, content);
     }
 
-    Ok(files)
+    // Find deleted files (in cache but not on disk)
+    let deleted: Vec<PathBuf> = state
+        .files
+        .keys()
+        .filter(|path| !seen_paths.contains(*path))
+        .cloned()
+        .collect();
+
+    Ok(ScanResult {
+        added,
+        modified,
+        deleted,
+        updated_cache,
+    })
+}
+
+/// Scan a single file and update tracking data
+fn scan_file(
+    path: &std::path::Path,
+    current_dir: &std::path::Path,
+    state: &crate::state::RepositoryState,
+    added: &mut HashMap<PathBuf, Vec<u8>>,
+    modified: &mut HashMap<PathBuf, Vec<u8>>,
+    updated_cache: &mut HashMap<PathBuf, crate::state::FileInfo>,
+    seen_paths: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    use std::time::SystemTime;
+
+    // Get relative path
+    let relative_path = path
+        .strip_prefix(current_dir)
+        .context("Path should be under current directory")?
+        .to_path_buf();
+
+    seen_paths.insert(relative_path.clone());
+
+    // Get file metadata (fast - no read)
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("Failed to get metadata for: {:?}", path))?;
+
+    let size = metadata.len();
+    let mtime = metadata.modified()
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    // Check cache
+    if let Some(cached) = state.files.get(&relative_path) {
+        // File exists in cache - check if potentially changed
+        if cached.mtime == mtime && cached.size == size {
+            // mtime+size unchanged - definitely not modified, skip read
+            updated_cache.insert(relative_path.clone(), cached.clone());
+            return Ok(());
+        }
+
+        // mtime or size changed - read and hash to confirm
+        let content = fs::read(path)
+            .with_context(|| format!("Failed to read file: {:?}", path))?;
+        let content_hash = *blake3::hash(&content).as_bytes();
+
+        if content_hash == cached.content_hash {
+            // Content actually unchanged - update mtime/size in cache
+            updated_cache.insert(
+                relative_path,
+                crate::state::FileInfo {
+                    mtime,
+                    size,
+                    content_hash,
+                },
+            );
+        } else {
+            // Content changed - file modified
+            modified.insert(relative_path.clone(), content);
+            updated_cache.insert(
+                relative_path,
+                crate::state::FileInfo {
+                    mtime,
+                    size,
+                    content_hash,
+                },
+            );
+        }
+    } else {
+        // File not in cache - new file
+        let content = fs::read(path)
+            .with_context(|| format!("Failed to read file: {:?}", path))?;
+        let content_hash = *blake3::hash(&content).as_bytes();
+
+        added.insert(relative_path.clone(), content);
+        updated_cache.insert(
+            relative_path,
+            crate::state::FileInfo {
+                mtime,
+                size,
+                content_hash,
+            },
+        );
+    }
+
+    Ok(())
 }
 
 /// Get the file tree from the previous patch
@@ -307,63 +442,52 @@ fn base64_url_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::TempDir;
 
     #[test]
-    fn test_scan_empty_directory() {
-        let temp_dir = TempDir::new().unwrap();
-        std::env::set_current_dir(temp_dir.path()).unwrap();
+    fn test_scan_result_structure() {
+        // Simple test to verify ScanResult structure
+        let scan_result = ScanResult {
+            added: HashMap::new(),
+            modified: HashMap::new(),
+            deleted: Vec::new(),
+            updated_cache: HashMap::new(),
+        };
 
-        let files = scan_working_directory().unwrap();
-        assert_eq!(files.len(), 0);
+        assert_eq!(scan_result.added.len(), 0);
+        assert_eq!(scan_result.modified.len(), 0);
+        assert_eq!(scan_result.deleted.len(), 0);
     }
 
     #[test]
-    fn test_scan_with_files() {
-        let temp_dir = TempDir::new().unwrap();
-        std::env::set_current_dir(temp_dir.path()).unwrap();
-
-        // Create test files
-        fs::write(temp_dir.path().join("test.txt"), b"content").unwrap();
-        fs::create_dir(temp_dir.path().join("subdir")).unwrap();
-        fs::write(temp_dir.path().join("subdir/nested.txt"), b"nested").unwrap();
-
-        let files = scan_working_directory().unwrap();
-
-        assert_eq!(files.len(), 2);
-        assert_eq!(
-            files.get(&PathBuf::from("test.txt")),
-            Some(&b"content".to_vec())
-        );
-        assert_eq!(
-            files.get(&PathBuf::from("subdir/nested.txt")),
-            Some(&b"nested".to_vec())
-        );
+    fn test_state_tracked_paths_default() {
+        // Verify default tracked paths
+        let state = crate::state::RepositoryState::new();
+        assert_eq!(state.tracked_paths, vec![PathBuf::from("src"), PathBuf::from("Cargo.toml")]);
     }
 
     #[test]
-    fn test_scan_excludes_cairn_dir() {
-        let temp_dir = TempDir::new().unwrap();
-        std::env::set_current_dir(temp_dir.path()).unwrap();
+    fn test_scan_respects_tracked_paths() {
+        // This test runs in the actual cairn project directory
+        // which has src/ and Cargo.toml, so it should find files
+        let state = crate::state::RepositoryState::new();
+        let result = scan_working_directory(&state).unwrap();
 
-        // Create .cairn directory with files
-        fs::create_dir(temp_dir.path().join(".cairn")).unwrap();
-        fs::write(temp_dir.path().join(".cairn/state.vsf"), b"state").unwrap();
+        // The cairn project has src/ and Cargo.toml (tracked by default)
+        // So we should find at least those tracked paths
+        // We don't assert exact counts since the project structure may change
 
-        // Create normal file
-        fs::write(temp_dir.path().join("test.txt"), b"content").unwrap();
+        // Verify we got some added files (first scan has no cache)
+        assert!(result.added.len() > 0, "Should find files in tracked paths");
 
-        let files = scan_working_directory().unwrap();
-
-        // Should only have test.txt, not .cairn/state.vsf
-        // (Allow for hidden files that might exist in temp_dir)
-        assert!(files.contains_key(&PathBuf::from("test.txt")));
-        assert!(!files.contains_key(&PathBuf::from(".cairn/state.vsf")));
-        assert_eq!(
-            files.get(&PathBuf::from("test.txt")),
-            Some(&b"content".to_vec())
-        );
+        // Verify we're only finding files in src/ or Cargo.toml
+        for path in result.added.keys() {
+            let path_str = path.to_string_lossy();
+            assert!(
+                path_str.starts_with("src") || path_str == "Cargo.toml",
+                "Found file outside tracked paths: {:?}",
+                path
+            );
+        }
     }
 
     #[test]

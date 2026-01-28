@@ -54,37 +54,23 @@ pub fn compute_diff(
     Ok(operations)
 }
 
-/// Compute binary diff between old and new x-encoded file content
+/// Compute binary diff between old and new file content
 ///
-/// For text files: Uses Myers algorithm for optimal diff on x-encoded bytes.
-/// For binary files: Stores full content as single Insert operation.
-/// All Copy operations use absolute byte positions in the x-encoded base content.
+/// Stores full content as single Insert operation (no fancy diffing).
+/// Simple, fast, no O(n×m) complexity issues.
 fn compute_binary_diff(
     base_snapshot: &[u8; 32],
     path: &PathBuf,
-    old_content: &[u8],
+    _old_content: &[u8],
     new_content: &[u8],
 ) -> Result<FileOp> {
-    // Detect if file is text or binary (x-encoded text has different characteristics)
-    let byte_ops = if is_likely_text(new_content) {
-        // Text file - use diff algorithm on x-encoded bytes
-        generate_byte_ops(old_content, new_content)
-    } else {
-        // Binary file - just store full content (no diff)
-        vec![ByteOp::Insert {
-            content: new_content.to_vec(),
-        }]
-    };
+    // Just store full content - simple and fast
+    let byte_ops = vec![ByteOp::Insert {
+        content: new_content.to_vec(),
+    }];
 
-    // Compute result hash of x-encoded content by reconstructing the file
-    let reconstructed = apply_byte_ops(old_content, &byte_ops);
-    let result_hash = *blake3::hash(&reconstructed).as_bytes();
-
-    // Verify reconstruction matches new x-encoded content
-    debug_assert_eq!(
-        reconstructed, new_content,
-        "Binary diff reconstruction mismatch"
-    );
+    // Compute result hash
+    let result_hash = *blake3::hash(new_content).as_bytes();
 
     Ok(FileOp::ModifyFile {
         path: path.clone(),

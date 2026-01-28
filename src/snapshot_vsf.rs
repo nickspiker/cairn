@@ -1,7 +1,7 @@
 //! Snapshot VSF storage - stores complete workspace state in a single VSF file
 //!
 //! Each snapshot is a VSF file containing the entire workspace using direct labels:
-//! ```
+//! ```text
 //! [snapshot_metadata]
 //!   created: eu6{oscillations}
 //!
@@ -73,14 +73,8 @@ fn build_file_tree(files: &HashMap<PathBuf, Vec<u8>>) -> Result<VsfSection> {
         // Convert path to VSF-compatible label: replace / with . and escape special chars
         let path_str = path_to_vsf_label(path)?;
 
-        // Auto-detect text vs binary and create appropriate VSF type
-        let content_value = if is_likely_text(content) {
-            // Text file - use Huffman compression
-            VsfType::x(String::from_utf8_lossy(content).to_string())
-        } else {
-            // Binary file - use v type with 'b' encoding (binary blob, raw bytes)
-            VsfType::v(b'b', content.to_vec())
-        };
+        // Store all files as wrapped binary (no compression during snapshot)
+        let content_value = VsfType::v(b'b', content.to_vec());
 
         // Add as direct label (path: content)
         root.add_field(&path_str, content_value);
@@ -327,14 +321,15 @@ pub fn extract_encoded_files(
     for field in &files_section.fields {
         // Each field is a file with label=path, value=content
         if let Some(value) = field.values.first() {
-            // Re-encode to get x-encoded bytes
+            // Get file content (raw bytes)
             let encoded_content = match value {
                 VsfType::x(text) => {
-                    // Text file - re-encode to get Huffman bytes
+                    // Legacy x-encoded (Huffman compressed) text - re-encode to bytes
+                    // This maintains backward compatibility with old snapshots
                     vsf::text_encoding::encode_text(text)
                 }
                 VsfType::v(b'b', bytes) => {
-                    // Binary file - raw bytes
+                    // Raw bytes (current format)
                     bytes.clone()
                 }
                 _ => return Err(anyhow!("Unexpected content type for file: {}", field.name)),

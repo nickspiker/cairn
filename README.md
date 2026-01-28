@@ -5,9 +5,8 @@
 > **⚠️ EXPERIMENTAL - v0.0.0 - NOT PRODUCTION READY**
 >
 > **Do not use on critical projects.** While all data is hash-verified and should not corrupt, there are known issues:
-> - Random build hangs may occur
 > - Rollback may not properly roll forward on subsequent builds
-> - Snapshots may fail to save correctly in some cases
+> - Some edge cases in snapshot restoration
 >
 > This release is for testing and claiming the crate name. Actively developed on Linux only. Windows/macOS untested.
 >
@@ -31,8 +30,10 @@ Git shows 800 lines across 12 files. You spend 2 hours trying to undo changes. F
 
 1. Install from VSCode Marketplace: search "Cairn"
 2. Open a Rust project
-3. Click **Build** in the Cairn Build Commands panel
+3. Click **Build** in the Cairn Build Commands panel (opens terminal with `cargo cairn build`)
 4. Done! Cairn auto-initializes and creates your first patch
+
+The extension is a **viewer only** - it displays your patch history but runs builds in the integrated terminal. This keeps things simple and prevents any hanging issues.
 
 ### CLI
 
@@ -47,6 +48,20 @@ cargo cairn build --release
 ```
 
 On first run, cairn auto-creates `.cairn/` - no init needed.
+
+### Optional: Shell Aliases (for convenience)
+
+Add to your `~/.bashrc` or `~/.zshrc`:
+
+```bash
+alias cb='cargo cairn build'
+alias ct='cargo cairn test'
+alias cr='cargo cairn run'
+```
+
+Now you can type `cb` instead of `cargo cairn build`!
+
+> **Note:** Cargo won't let you override built-in commands like `build` in `.cargo/config.toml`, so shell aliases are the way to go.
 
 ---
 
