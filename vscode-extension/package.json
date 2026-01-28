@@ -3,7 +3,7 @@
   "displayName": "Cairn",
   "description": "Build-gated version control for Rust - automatically snapshot on successful builds",
   "version": "0.0.1",
-  "publisher": "cairn",
+  "publisher": "fractaldecoder",
   "repository": {
     "type": "git",
     "url": "https://github.com/yourusername/cairn"
