@@ -129,10 +129,12 @@ export function activate(context: vscode.ExtensionContext) {
     // Create tree view in sidebar
     const treeProvider = new CairnTreeProvider();
     outputChannel.appendLine('[INIT] Creating tree view');
-    vscode.window.createTreeView('cairnView', {
-        treeDataProvider: treeProvider
+    const treeView = vscode.window.createTreeView('cairnView', {
+        treeDataProvider: treeProvider,
+        showCollapseAll: true
     });
-    outputChannel.appendLine('[INIT] Tree view created');
+    context.subscriptions.push(treeView);
+    outputChannel.appendLine('[INIT] Tree view created and registered');
 
     // Register refresh command
     context.subscriptions.push(
