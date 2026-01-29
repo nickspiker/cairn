@@ -28,7 +28,7 @@ pub struct FileInfo {
 /// Persisted to .cairn/state.vsf
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryState {
-    /// Current patch ID (VSF provenance hash, base64url encoded)
+    /// Current patch ID (VSF provenance hash, base58 encoded)
     pub head: String,
 
     /// Patch history in insertion order (chronological)
@@ -42,9 +42,15 @@ pub struct RepositoryState {
     /// Explicitly tracked paths (files or directories)
     /// Default: ["src", "Cargo.toml"]
     pub tracked_paths: Vec<PathBuf>,
+}
 
-    /// Per-file metadata cache for fast change detection
-    /// Maps relative file paths to their metadata (mtime, size, hash)
+/// Ephemeral in-memory cache for change detection (not persisted to state.vsf)
+///
+/// This cache is cleared between builds and rebuilt from filesystem stats.
+/// It avoids re-hashing unchanged files by checking mtime+size first.
+#[derive(Debug, Clone, Default)]
+pub struct BuildCache {
+    /// Maps file paths to (mtime, size, hash)
     pub files: HashMap<PathBuf, FileInfo>,
 }
 
@@ -56,7 +62,6 @@ impl RepositoryState {
             patches: Vec::new(),
             latest_snapshot: [0u8; 32],
             tracked_paths: vec![PathBuf::from("src"), PathBuf::from("Cargo.toml")],
-            files: HashMap::new(),
         }
     }
 
@@ -83,31 +88,11 @@ impl RepositoryState {
             tracked_section.add_field(&format!("t{}", idx), VsfType::l(path.to_string_lossy().to_string()));
         }
 
-        // 4. Files cache section
-        let mut files_section = VsfSection::new("files");
-        for (idx, (path, info)) in self.files.iter().enumerate() {
-            let path_str = path.to_string_lossy().to_string();
-            // Store each file as a subsection with path, mtime, size, hash
-            let mtime_secs = info.mtime
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            let mut file_subsection = VsfSection::new(&format!("f{}", idx));
-            file_subsection.add_field("path", VsfType::l(path_str));
-            file_subsection.add_field("mtime", VsfType::n(mtime_secs as usize));
-            file_subsection.add_field("size", VsfType::n(info.size as usize));
-            file_subsection.add_field("hash", VsfType::hp(info.content_hash.to_vec()));
-
-            files_section.add_subsection(file_subsection);
-        }
-
-        // 5. Build VSF file
+        // Build VSF file (no files cache section - kept in memory only)
         let builder = VsfBuilder::new()
             .add_section_direct(metadata_section)
             .add_section_direct(patches_section)
-            .add_section_direct(tracked_section)
-            .add_section_direct(files_section);
+            .add_section_direct(tracked_section);
 
         builder.build().map_err(|e| anyhow!(e))
     }
@@ -125,7 +110,6 @@ impl RepositoryState {
         let mut patches = Vec::new();
         let mut latest_snapshot = [0u8; 32];
         let mut tracked_paths: Vec<PathBuf> = Vec::new();
-        let mut files: HashMap<PathBuf, FileInfo> = HashMap::new();
 
         for field in &header.fields {
             // Skip empty sections
@@ -187,45 +171,7 @@ impl RepositoryState {
                     }
                 }
                 "files" => {
-                    // Parse file cache subsections
-                    for subsection in &section.subsections {
-                        let mut path: Option<PathBuf> = None;
-                        let mut mtime: Option<u64> = None;
-                        let mut size: Option<u64> = None;
-                        let mut hash: Option<[u8; 32]> = None;
-
-                        if let Some(field) = subsection.get_field("path") {
-                            if let Some(VsfType::l(p)) = field.values.first() {
-                                path = Some(PathBuf::from(p));
-                            }
-                        }
-                        if let Some(field) = subsection.get_field("mtime") {
-                            if let Some(VsfType::n(t)) = field.values.first() {
-                                mtime = Some(*t as u64);
-                            }
-                        }
-                        if let Some(field) = subsection.get_field("size") {
-                            if let Some(VsfType::n(s)) = field.values.first() {
-                                size = Some(*s as u64);
-                            }
-                        }
-                        if let Some(field) = subsection.get_field("hash") {
-                            if let Some(h) = extract_hash(field.values.first().unwrap()) {
-                                hash = Some(h);
-                            }
-                        }
-
-                        if let (Some(p), Some(t), Some(s), Some(h)) = (path, mtime, size, hash) {
-                            files.insert(
-                                p,
-                                FileInfo {
-                                    mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t),
-                                    size: s,
-                                    content_hash: h,
-                                },
-                            );
-                        }
-                    }
+                    // Legacy files section - skip (now using in-memory cache only)
                 }
                 _ => {
                     // Unknown section, skip
@@ -243,7 +189,6 @@ impl RepositoryState {
             } else {
                 tracked_paths
             },
-            files,
         })
     }
 

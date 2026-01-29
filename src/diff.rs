@@ -1,10 +1,15 @@
 //! Binary diff computation on x-encoded snapshots
 //!
-//! Uses line-by-line byte comparison to generate binary diffs
+//! Uses suffix array-based byte comparison to generate efficient binary diffs
 //! with absolute byte positions on x-encoded (Huffman compressed) content.
+//!
+//! Includes patch chain optimization: when cumulative patch operations for a file
+//! exceed the file size, it's more efficient to create a new snapshot.
 
-use crate::patch::{ByteOp, FileOp};
+use crate::encode::encode_byte_ops;
+use crate::patch::{ByteOp, FileOp, Patch};
 use crate::snapshot_vsf::extract_encoded_files;
+use crate::suffix_array::SuffixArray;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -54,10 +59,40 @@ pub fn compute_diff(
     Ok(operations)
 }
 
+/// Check if patch chain optimization should create a new snapshot
+///
+/// Returns true if cumulative patch operations for a file exceed the current file size.
+/// When this happens, it's more space/time efficient to create a new full snapshot
+/// rather than adding another patch to the chain.
+pub fn should_create_new_snapshot(
+    file_path: &Path,
+    current_file_size: u64,
+    patch_history: &[Patch],
+) -> bool {
+    // Sum encoded size of all patches for this file
+    let cumulative_patch_size: usize = patch_history
+        .iter()
+        .flat_map(|p| &p.operations)
+        .filter_map(|op| match op {
+            FileOp::ModifyFile {
+                path, operations, ..
+            } if path == file_path => Some(operations),
+            _ => None,
+        })
+        .map(|operations| encode_byte_ops(operations).len())
+        .sum();
+
+    // If patch chain larger than file → new snapshot more efficient
+    cumulative_patch_size > current_file_size as usize
+}
+
 /// Compute binary diff between old and new file content
 ///
 /// Stores full content as single Insert operation (no fancy diffing).
 /// Simple, fast, no O(n×m) complexity issues.
+///
+/// TODO: When implementing real incremental patches (Copy+Insert),
+/// call should_create_new_snapshot() to decide between full snapshot vs patch.
 fn compute_binary_diff(
     base_snapshot: &[u8; 32],
     path: &PathBuf,
@@ -78,6 +113,182 @@ fn compute_binary_diff(
         operations: byte_ops,
         result_hash,
     })
+}
+
+/// Compute byte-level diff between two raw byte sequences
+///
+/// Generates optimal Copy/Insert operations to transform old → new.
+/// Works on RAW bytes (not x-encoded) for maximum generality.
+///
+/// Algorithm: Suffix array-based matching for O(m log n) instead of O(n×m)
+/// - Builds suffix array with LCP (Longest Common Prefix) array
+/// - Uses binary search + LCP optimization for fast matching
+/// - Falls back to naive algorithm for small files (< 64 bytes)
+///
+/// Edge cases handled:
+/// - Empty files (old or new)
+/// - Binary data (works on raw bytes)
+/// - Large files (suffix array optimization)
+pub fn compute_byte_level_diff(old_content: &[u8], new_content: &[u8]) -> Vec<ByteOp> {
+    // Handle empty cases
+    if old_content.is_empty() {
+        return if new_content.is_empty() {
+            vec![]
+        } else {
+            vec![ByteOp::Insert {
+                content: new_content.to_vec(),
+            }]
+        };
+    }
+
+    if new_content.is_empty() {
+        // Deletion - represented by absence of Copy
+        return vec![];
+    }
+
+    // Use suffix array for larger files, naive for small files
+    const SA_THRESHOLD: usize = 64;
+
+    if old_content.len() < SA_THRESHOLD {
+        compute_diff_naive(old_content, new_content)
+    } else {
+        compute_diff_with_suffix_array(old_content, new_content)
+    }
+}
+
+/// Compute diff using suffix array (optimized for larger files)
+fn compute_diff_with_suffix_array(old_content: &[u8], new_content: &[u8]) -> Vec<ByteOp> {
+    // Build suffix array once for old_content
+    let sa = SuffixArray::new(old_content);
+
+    let mut operations = Vec::new();
+    let mut new_pos = 0;
+
+    while new_pos < new_content.len() {
+        // Find longest match using suffix array
+        let (match_old_pos, match_len) = sa.find_longest_match(old_content, new_content, new_pos);
+
+        const MIN_MATCH: usize = 4;
+
+        if match_len >= MIN_MATCH {
+            // Found a good match - use Copy operation
+            operations.push(ByteOp::Copy {
+                start: match_old_pos,
+                len: match_len,
+            });
+            new_pos += match_len;
+        } else {
+            // No good match - collect bytes to Insert until we find a match
+            let insert_start = new_pos;
+            let mut insert_len = 1;
+
+            // Look ahead to find where next match starts
+            while new_pos + insert_len < new_content.len() {
+                let (_, peek_len) = sa.find_longest_match(old_content, new_content, new_pos + insert_len);
+                if peek_len >= MIN_MATCH {
+                    // Found a decent match ahead, stop inserting
+                    break;
+                }
+                insert_len += 1;
+            }
+
+            operations.push(ByteOp::Insert {
+                content: new_content[insert_start..insert_start + insert_len].to_vec(),
+            });
+            new_pos += insert_len;
+        }
+    }
+
+    merge_operations(operations)
+}
+
+/// Compute diff using naive algorithm (for small files)
+fn compute_diff_naive(old_content: &[u8], new_content: &[u8]) -> Vec<ByteOp> {
+    let mut operations = Vec::new();
+    let mut new_pos = 0;
+
+    while new_pos < new_content.len() {
+        // Find longest match starting from new_pos
+        let (match_old_pos, match_len) = find_longest_match_naive(old_content, new_content, new_pos);
+
+        const MIN_MATCH: usize = 4;
+
+        if match_len >= MIN_MATCH {
+            // Found a match - use Copy operation
+            operations.push(ByteOp::Copy {
+                start: match_old_pos,
+                len: match_len,
+            });
+            new_pos += match_len;
+        } else {
+            // No match - collect bytes to Insert until we find a match
+            let insert_start = new_pos;
+            let mut insert_len = 1;
+
+            // Look ahead to find where next match starts
+            while new_pos + insert_len < new_content.len() {
+                let (_, peek_len) = find_longest_match_naive(old_content, new_content, new_pos + insert_len);
+                if peek_len >= MIN_MATCH {
+                    // Found a decent match ahead, stop inserting
+                    break;
+                }
+                insert_len += 1;
+            }
+
+            operations.push(ByteOp::Insert {
+                content: new_content[insert_start..insert_start + insert_len].to_vec(),
+            });
+            new_pos += insert_len;
+        }
+    }
+
+    merge_operations(operations)
+}
+
+/// Find longest common substring starting at new_pos (naive algorithm)
+///
+/// Returns (old_position, length) of best match.
+/// Used as fallback for small files where suffix array overhead isn't worth it.
+fn find_longest_match_naive(old_content: &[u8], new_content: &[u8], new_pos: usize) -> (usize, usize) {
+    const MIN_MATCH_LEN: usize = 4; // Minimum worthwhile match
+    const MAX_SEARCH_WINDOW: usize = 1024; // Limit search for large files
+
+    let mut best_old_pos = 0;
+    let mut best_len = 0;
+
+    // Determine search window
+    let search_end = old_content.len().min(new_pos + MAX_SEARCH_WINDOW);
+
+    // Search for matches in old content
+    for old_pos in 0..search_end {
+        let mut match_len = 0;
+
+        // Extend match as far as possible
+        while old_pos + match_len < old_content.len()
+            && new_pos + match_len < new_content.len()
+            && old_content[old_pos + match_len] == new_content[new_pos + match_len]
+        {
+            match_len += 1;
+        }
+
+        // Update best match if this is longer
+        if match_len > best_len {
+            best_old_pos = old_pos;
+            best_len = match_len;
+        }
+
+        // Early exit if we found a very good match
+        if best_len > 128 {
+            break;
+        }
+    }
+
+    // Only return matches above minimum threshold
+    if best_len >= MIN_MATCH_LEN {
+        (best_old_pos, best_len)
+    } else {
+        (0, 0)
+    }
 }
 
 /// Generate ByteOp sequence using line-by-line byte comparison

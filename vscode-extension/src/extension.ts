@@ -83,32 +83,43 @@ class CairnTreeProvider implements vscode.TreeDataProvider<CairnTreeItem> {
             return [];
         }
 
-        const cairnDir = path.join(workspaceFolders[0].uri.fsPath, '.cairn', 'patches');
-        outputChannel.appendLine(`[PATCHES] Reading from: ${cairnDir}`);
+        const commitsDir = path.join(workspaceFolders[0].uri.fsPath, '.cairn', 'commits');
+        outputChannel.appendLine(`[PATCHES] Reading from: ${commitsDir}`);
 
-        if (!fs.existsSync(cairnDir)) {
+        if (!fs.existsSync(commitsDir)) {
             outputChannel.appendLine('[PATCHES] Directory does not exist');
             return [new CairnTreeItem('No patches yet', vscode.TreeItemCollapsibleState.None)];
         }
 
         try {
-            const files = fs.readdirSync(cairnDir, { withFileTypes: true });
+            const files = fs.readdirSync(commitsDir, { withFileTypes: true });
             outputChannel.appendLine(`[PATCHES] Found ${files.length} files`);
 
             const patches = files
-                .filter(dirent => dirent.isFile())
-                .map(dirent => dirent.name)
-                .sort()
-                .reverse() // Most recent first
-                .map(file => {
+                .filter(dirent => dirent.isFile() && dirent.name.endsWith('.vsf'))
+                .map(dirent => {
+                    const filePath = path.join(commitsDir, dirent.name);
+                    const stats = fs.statSync(filePath);
+                    return {
+                        name: dirent.name.replace('.vsf', ''),
+                        mtime: stats.mtime
+                    };
+                })
+                .sort((a, b) => b.mtime.getTime() - a.mtime.getTime()) // Most recent first
+                .map(patch => {
+                    const shortHash = patch.name.substring(0, 8);
+                    const timeStr = patch.mtime.toLocaleString();
+                    // TODO: Get current patch from state.vsf to show ⚪ for current, ⚫ for others
+                    const icon = '⚫'; // Will be ⚪ for current patch
                     return new CairnTreeItem(
-                        `📦 ${file}`,
+                        `${icon} ${shortHash} (${timeStr})`,
                         vscode.TreeItemCollapsibleState.None,
                         {
-                            command: 'cairn.showPatch',
-                            title: 'Show Patch',
-                            arguments: [file]
-                        }
+                            command: 'cairn.jumpPatch',
+                            title: 'Switch to Patch',
+                            arguments: [patch.name]
+                        },
+                        'patch'
                     );
                 });
 
@@ -143,6 +154,34 @@ export function activate(context: vscode.ExtensionContext) {
             treeProvider.refresh();
         })
     );
+
+    // Watch .cairn/patches directory for changes and auto-refresh
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (workspaceFolders) {
+        const cairnCommitsPattern = new vscode.RelativePattern(
+            workspaceFolders[0],
+            '.cairn/patches/**/*.vsf'
+        );
+        const fileWatcher = vscode.workspace.createFileSystemWatcher(cairnCommitsPattern);
+
+        fileWatcher.onDidCreate(() => {
+            outputChannel.appendLine('[WATCH] New patch created, refreshing tree');
+            treeProvider.refresh();
+        });
+
+        fileWatcher.onDidDelete(() => {
+            outputChannel.appendLine('[WATCH] Patch deleted, refreshing tree');
+            treeProvider.refresh();
+        });
+
+        fileWatcher.onDidChange(() => {
+            outputChannel.appendLine('[WATCH] Patch modified, refreshing tree');
+            treeProvider.refresh();
+        });
+
+        context.subscriptions.push(fileWatcher);
+        outputChannel.appendLine('[INIT] File watcher registered for .cairn/patches');
+    }
 
     // Register build commands
     context.subscriptions.push(
@@ -271,12 +310,25 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.clean', async () => {
             outputChannel.appendLine('[CMD] CLEAN command triggered');
+
+            // Confirm with user first
+            const answer = await vscode.window.showWarningMessage(
+                'This will DELETE the .cairn directory and ALL patch history. This action cannot be undone.',
+                { modal: true },
+                'Delete'
+            );
+
+            if (answer !== 'Delete') {
+                outputChannel.appendLine('[CMD] Clean cancelled by user');
+                return;
+            }
+
             const task = new vscode.Task(
                 { type: 'shell' },
                 vscode.TaskScope.Workspace,
                 'Cairn Clean',
                 'cairn',
-                new vscode.ShellExecution('cargo cairn clean')
+                new vscode.ShellExecution('echo y | cairn clean')
             );
             task.presentationOptions = {
                 reveal: vscode.TaskRevealKind.Always,
@@ -284,25 +336,44 @@ export function activate(context: vscode.ExtensionContext) {
             };
             await vscode.tasks.executeTask(task);
             outputChannel.appendLine('[CMD] Clean task started');
+
+            // Refresh the tree after cleaning
+            setTimeout(() => treeProvider.refresh(), 1000);
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.showPatch', async (patchName: string) => {
-            outputChannel.appendLine(`[CMD] SHOW PATCH command triggered for: ${patchName}`);
+        vscode.commands.registerCommand('cairn.jumpPatch', async (patchHash: string) => {
+            outputChannel.appendLine(`[CMD] JUMP PATCH command triggered for: ${patchHash}`);
+
+            // Confirm with user
+            const answer = await vscode.window.showWarningMessage(
+                `Switch to patch ${patchHash.substring(0, 8)}? This will restore your workspace to that patch state.`,
+                'Switch', 'Cancel'
+            );
+
+            if (answer !== 'Switch') {
+                outputChannel.appendLine('[CMD] Jump cancelled by user');
+                return;
+            }
+
+            // Use cairn jump command to switch patches
             const task = new vscode.Task(
                 { type: 'shell' },
                 vscode.TaskScope.Workspace,
-                'Cairn Show Patch',
+                'Switch Patch',
                 'cairn',
-                new vscode.ShellExecution(`cargo cairn show ${patchName}`)
+                new vscode.ShellExecution(`cairn jump ${patchHash}`)
             );
             task.presentationOptions = {
                 reveal: vscode.TaskRevealKind.Always,
                 panel: vscode.TaskPanelKind.Dedicated
             };
             await vscode.tasks.executeTask(task);
-            outputChannel.appendLine('[CMD] Show patch task started');
+            outputChannel.appendLine('[CMD] Jump task started');
+
+            // Refresh tree after jump
+            setTimeout(() => treeProvider.refresh(), 1000);
         })
     );
 

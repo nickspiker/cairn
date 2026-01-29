@@ -7,14 +7,21 @@
 //! - Easy rollback to any successful build state
 
 mod apply;
+mod blob;
+mod jump;
+mod patch_storage;
 mod decode;
 mod diff;
 mod encode;
+mod hash_encoding;
 mod mnemonic;
 mod patch;
+mod reconstruct;
 mod snapshot;
 mod snapshot_vsf;
 mod state;
+mod suffix_array;
+mod tree;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -32,9 +39,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize cairn in the current directory
-    Init,
-
     /// List all patches
     List,
 
@@ -50,6 +54,15 @@ enum Commands {
         patch_id: String,
     },
 
+    /// Switch to a different patch (navigate patch history)
+    Jump {
+        /// Patch ID (5-word mnemonic or full base64url hash)
+        patch_id: String,
+    },
+
+    /// Delete the .cairn directory and all patch history
+    Clean,
+
     /// Create a patch manually (for testing)
     #[command(hide = true)]
     Snapshot {
@@ -63,10 +76,6 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init => {
-            println!("Initializing .cairn/ directory...");
-            cmd_init()?;
-        }
         Commands::List => {
             cmd_list()?;
         }
@@ -76,53 +85,17 @@ fn main() -> Result<()> {
         Commands::Rollback { patch_id } => {
             cmd_rollback(&patch_id)?;
         }
+        Commands::Jump { patch_id } => {
+            cmd_jump(&patch_id)?;
+        }
+        Commands::Clean => {
+            cmd_clean()?;
+        }
         Commands::Snapshot { message } => {
             cmd_snapshot(&message)?;
         }
     }
 
-    Ok(())
-}
-
-fn cmd_init() -> Result<()> {
-    let cairn_dir = PathBuf::from(".cairn");
-
-    // Check if already initialized
-    if cairn_dir.exists() {
-        eprintln!("WARNING: .cairn/ directory already exists!");
-        eprintln!("This will DELETE all existing patches and start over.");
-        eprintln!("");
-        eprint!("Are you sure you want to continue? (y/N): ");
-
-        use std::io::{self, Write};
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-
-        let response = input.trim().to_lowercase();
-        if response != "y" && response != "yes" {
-            println!("Aborted.");
-            return Ok(());
-        }
-
-        println!("Removing existing .cairn/ directory...");
-        fs::remove_dir_all(&cairn_dir).context("Failed to remove existing .cairn directory")?;
-    }
-
-    // Create .cairn directory structure
-    fs::create_dir(&cairn_dir).context("Failed to create .cairn directory")?;
-    fs::create_dir(cairn_dir.join("patches")).context("Failed to create patches directory")?;
-    fs::create_dir(cairn_dir.join("snapshots")).context("Failed to create snapshots directory")?;
-
-    // Create initial empty state
-    let initial_state = state::RepositoryState::new();
-    initial_state
-        .save(&cairn_dir)
-        .context("Failed to save initial state")?;
-
-    println!("✓ Initialized cairn repository in .cairn/");
-    println!("  Build your project with 'cargo build' to create snapshots");
     Ok(())
 }
 
@@ -246,6 +219,72 @@ fn cmd_rollback(patch_id: &str) -> Result<()> {
     return Err(anyhow!(
         "Rollback temporarily disabled with fish tacos - being refactored for snapshot-based storage"
     ));
+}
+
+fn cmd_jump(patch_id: &str) -> Result<()> {
+    let cairn_dir = PathBuf::from(".cairn");
+
+    // Check if initialized
+    if !cairn_dir.exists() {
+        return Err(anyhow!(
+            "Not a cairn repository (no .cairn directory found)"
+        ));
+    }
+
+    // Load repository state
+    let repo_state =
+        state::RepositoryState::load(&cairn_dir).context("Failed to load repository state")?;
+
+    // Find patch by prefix match (supports both mnemonic and base64url)
+    let target_patch_id = find_patch_by_id(&repo_state.patches, patch_id)?;
+
+    // Check if already at this patch
+    if target_patch_id == repo_state.head {
+        let mnemonic = mnemonic::patch_id_to_mnemonic(&target_patch_id, 5)
+            .unwrap_or_else(|_| format!("{}...", &target_patch_id[..16]));
+        println!("Already at patch {}", mnemonic);
+        return Ok(());
+    }
+
+    // Jump to the patch
+    println!("Switching to patch {}...", &target_patch_id[..8]);
+    jump::jump_to_patch(&cairn_dir, &target_patch_id)?;
+
+    Ok(())
+}
+
+fn cmd_clean() -> Result<()> {
+    let cairn_dir = PathBuf::from(".cairn");
+
+    // Check if .cairn exists
+    if !cairn_dir.exists() {
+        println!("No .cairn directory found - nothing to clean");
+        return Ok(());
+    }
+
+    // Warn the user
+    eprintln!("⚠️  WARNING: This will DELETE the .cairn directory and ALL patch history!");
+    eprintln!("   This action cannot be undone.");
+    eprintln!();
+    eprint!("Are you sure you want to continue? (y/N): ");
+
+    use std::io::{self, Write};
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    let response = input.trim().to_lowercase();
+    if response != "y" && response != "yes" {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    println!("Removing .cairn directory...");
+    fs::remove_dir_all(&cairn_dir).context("Failed to remove .cairn directory")?;
+
+    println!("✓ Cleaned cairn repository");
+    Ok(())
 }
 
 fn cmd_snapshot(message: &str) -> Result<()> {

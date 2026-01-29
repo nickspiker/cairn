@@ -109,8 +109,8 @@ fn create_pending_snapshot() -> Result<bool> {
     let state = cairn::state::RepositoryState::load(&cairn_dir)
         .context("Failed to load repository state")?;
 
-    // Scan for changes (incremental - only reads changed files)
-    let scan_result = cairn::snapshot::scan_working_directory(&state)
+    // Scan for changes (no persistent cache - recompute each time)
+    let scan_result = cairn::snapshot::scan_working_directory(&state, None)
         .context("Failed to scan working directory")?;
 
     // Check if there are any changes
@@ -131,7 +131,7 @@ fn create_pending_snapshot() -> Result<bool> {
     Ok(true)
 }
 
-/// Commit the pending snapshot as a real patch
+/// Commit the pending snapshot as a real patch using Git-style architecture
 fn commit_pending_snapshot() -> Result<()> {
     let cairn_dir = PathBuf::from(".cairn");
     let pending_file = cairn_dir.join(".pending");
@@ -140,30 +140,116 @@ fn commit_pending_snapshot() -> Result<()> {
         return Ok(()); // Nothing to commit
     }
 
-    // Read the pending scan result
+    // Read the pending scan result (used to detect if snapshot needed)
     let pending_data = std::fs::read(&pending_file).context("Failed to read pending snapshot")?;
-    let scan_result: cairn::snapshot::ScanResult =
+    let _scan_result: cairn::snapshot::ScanResult =
         bincode::deserialize(&pending_data).context("Failed to deserialize pending snapshot")?;
 
-    // Create patch from scan result (TODO: implement incremental patch creation)
-    let build_hash = blake3::hash(b"cargo-cairn build");
-    let message = "Successful build".to_string();
-
-    // For now, convert scan result to full file map for compatibility
-    let mut all_files = scan_result.added.clone();
-    all_files.extend(scan_result.modified.clone());
-
-    cairn::snapshot::create_snapshot_from_files(&cairn_dir, message, build_hash, all_files)
-        .context("Failed to create patch")?;
-
-    // Reload state after patch creation (it was updated by create_snapshot_from_files)
+    // Load current state to get parent commit (if exists)
     let mut state = cairn::state::RepositoryState::load(&cairn_dir)
-        .context("Failed to reload repository state")?;
+        .context("Failed to load repository state")?;
 
-    // Update file cache from scan result
-    state.files = scan_result.updated_cache;
+    // Get parent commit hash (None for first commit)
+    let parent_commit_hp = if let Some(head) = state.latest() {
+        // Decode base58 head to Blake3Hash
+        let parent_bytes = bs58::decode(head)
+            .into_vec()
+            .context("Failed to decode parent commit hash")?;
+        if parent_bytes.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&parent_bytes);
+            Some(arr)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
-    // Save updated state with new file cache
+    // 1. Scan tracked files and store blobs
+    let file_to_blob = cairn::blob::scan_and_store_blobs(&state.tracked_paths)
+        .context("Failed to scan and store blobs")?;
+
+    // 2. Create tree from blob references
+    let tree_hp = cairn::tree::create_tree(&file_to_blob)
+        .context("Failed to create tree")?;
+
+    // 3. Compute diffs from parent (if exists)
+    let file_diffs = if let Some(parent_hp) = parent_commit_hp {
+        // Load parent commit and tree
+        let parent_commit = cairn::patch_storage::load_commit(&parent_hp)
+            .context("Failed to load parent commit")?;
+        let parent_tree = cairn::tree::load_tree(&parent_commit.tree_hp)
+            .context("Failed to load parent tree")?;
+
+        let mut diffs = std::collections::HashMap::new();
+
+        // For each file in current tree, check if it changed
+        for (path, new_blob_hash) in &file_to_blob {
+            if let Some(old_blob_hash) = parent_tree.get(path) {
+                // File exists in parent - check if content changed
+                if old_blob_hash != new_blob_hash {
+                    // File modified - compute byte-level diff
+                    let old_content = cairn::blob::load_blob(old_blob_hash)
+                        .context("Failed to load old blob")?;
+                    let new_content = cairn::blob::load_blob(new_blob_hash)
+                        .context("Failed to load new blob")?;
+
+                    let diff_ops = cairn::diff::compute_byte_level_diff(&old_content, &new_content);
+
+                    // TODO: Implement chain optimization using should_create_new_snapshot
+                    // For now, always use diff strategy
+                    let file_diff = cairn::patch_storage::FileDiff {
+                        strategy: cairn::patch_storage::DiffStrategy::Diff,
+                        old_blob: *old_blob_hash,
+                        new_blob: *new_blob_hash,
+                        ops: diff_ops,
+                    };
+                    diffs.insert(path.clone(), file_diff);
+                }
+                // If hashes same, no diff needed (file unchanged)
+            } else {
+                // File added (not in parent) - store full content as Insert
+                let new_content = cairn::blob::load_blob(new_blob_hash)
+                    .context("Failed to load new blob")?;
+                let file_diff = cairn::patch_storage::FileDiff {
+                    strategy: cairn::patch_storage::DiffStrategy::Diff,
+                    old_blob: [0u8; 32],  // No old blob for new file
+                    new_blob: *new_blob_hash,
+                    ops: vec![cairn::patch::ByteOp::Insert {
+                        content: new_content,
+                    }],
+                };
+                diffs.insert(path.clone(), file_diff);
+            }
+        }
+
+        // Note: Deleted files (in parent but not current) are represented
+        // by absence from current tree - no explicit diff needed
+
+        Some(diffs)
+    } else {
+        None // First commit - no parent, no diffs
+    };
+
+    // 4. Create commit with tree reference and diffs
+    let build_hash = *blake3::hash(b"cargo-cairn build").as_bytes();
+    let commit_info = cairn::patch_storage::CommitInfo {
+        message: "Successful build".to_string(),
+        build_hash,
+        tree_hp,
+        parent_commit_hp,
+        file_diffs,
+    };
+
+    let commit_hp = cairn::patch_storage::create_commit(commit_info)
+        .context("Failed to create commit")?;
+
+    // 4. Update state with new commit (use base58 encoding for consistency)
+    let commit_hash_str = bs58::encode(&commit_hp).into_string();
+
+    // For snapshot hash, use the tree's hp (directory structure snapshot)
+    state.add_patch(commit_hash_str, tree_hp);
     state.save(&cairn_dir).context("Failed to save state")?;
 
     // Remove pending file
@@ -184,14 +270,15 @@ fn discard_pending_snapshot() -> Result<()> {
     Ok(())
 }
 
-/// Auto-initialize cairn repository
+/// Auto-initialize cairn repository with flat directory structure
 fn auto_init(cairn_dir: &PathBuf) -> Result<()> {
     use std::fs;
 
-    // Create .cairn directory structure
+    // Create .cairn directory structure (flattened)
     fs::create_dir(cairn_dir).context("Failed to create .cairn directory")?;
-    fs::create_dir(cairn_dir.join("patches")).context("Failed to create patches directory")?;
     fs::create_dir(cairn_dir.join("blobs")).context("Failed to create blobs directory")?;
+    fs::create_dir(cairn_dir.join("trees")).context("Failed to create trees directory")?;
+    fs::create_dir(cairn_dir.join("patches")).context("Failed to create patches directory")?;
 
     // Create initial empty state
     let initial_state = cairn::state::RepositoryState::new();

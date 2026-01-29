@@ -10,6 +10,7 @@
 
 use crate::patch::{ByteOp, FileOp, Patch};
 use anyhow::Result;
+use std::path::Path;
 use vsf::types::Vector;
 use vsf::{VsfBuilder, VsfSection, VsfType};
 
@@ -58,7 +59,49 @@ fn encode_metadata_section(metadata: &crate::patch::PatchMetadata) -> Result<Vsf
     Ok(section)
 }
 
-/// Encode operations section with FileOp and ByteOp
+/// Add a file operation to a section using nested directory structure
+///
+/// Converts flat paths like "src/lib.rs" into nested sections with filename as value:
+/// operations/src/(f: op_type, "lib.rs", ...)
+fn add_nested_file_op(section: &mut VsfSection, path: &Path, mut op_data: Vec<VsfType>) {
+    let components: Vec<&str> = path
+        .components()
+        .filter_map(|c| {
+            if let std::path::Component::Normal(os_str) = c {
+                os_str.to_str()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if components.is_empty() {
+        return;
+    }
+
+    // Navigate/create nested directory structure
+    let mut current_section = section;
+    for dir in &components[..components.len() - 1] {
+        // VSF names must be lowercase, so convert directory names
+        let dir_name = dir.to_lowercase().replace(['.','-'], "_");
+
+        // Get or create subsection for this directory
+        if !current_section.has_subsection(&dir_name) {
+            let subsection = VsfSection::new(dir_name.clone());
+            current_section.add_subsection(subsection);
+        }
+        current_section = current_section.get_mut_subsection(&dir_name).unwrap();
+    }
+
+    // Add the filename as an l (ASCII) value after the operation type
+    let filename = components.last().unwrap();
+    op_data.insert(1, VsfType::l(filename.to_string()));
+
+    // Use generic field name "f" for all files
+    current_section.add_field_multi("f", op_data);
+}
+
+/// Encode operations section with FileOp and ByteOp using nested directory structure
 fn encode_operations_section(operations: &[FileOp]) -> Result<VsfSection> {
     let mut section = VsfSection::new("operations");
 
@@ -73,47 +116,50 @@ fn encode_operations_section(operations: &[FileOp]) -> Result<VsfSection> {
                 // Encode ByteOp operations as a byte vector
                 let byte_ops_encoded = encode_byte_ops(byte_ops);
 
-                section.add_field_multi(
-                    "op",
-                    vec![
-                        VsfType::u3(0),                                 // Op type: 0=modify file
-                        VsfType::l(path.to_string_lossy().to_string()), // File path
-                        VsfType::hp(base_snapshot.to_vec()), // Base snapshot hash (provenance)
-                        VsfType::hp(result_hash.to_vec()), // Result hash (provenance of x-encoded result)
-                        VsfType::v_u3(Vector {
-                            data: byte_ops_encoded,
-                        }), // ByteOp sequence (on x-encoded content)
-                    ],
-                );
+                let op_data = vec![
+                    VsfType::u3(0), // Op type: 0=modify file
+                    VsfType::hp(base_snapshot.to_vec()), // Base snapshot hash (provenance)
+                    VsfType::hp(result_hash.to_vec()), // Result hash (provenance of x-encoded result)
+                    VsfType::v_u3(Vector {
+                        data: byte_ops_encoded,
+                    }), // ByteOp sequence (on x-encoded content)
+                ];
+
+                add_nested_file_op(&mut section, path, op_data);
             }
 
             FileOp::AddFile { path } => {
-                section.add_field_multi(
-                    "op",
-                    vec![
-                        VsfType::u3(1),                                 // Op type: 1=add file
-                        VsfType::l(path.to_string_lossy().to_string()), // File path (content in new snapshot)
-                    ],
-                );
+                let op_data = vec![
+                    VsfType::u3(1), // Op type: 1=add file
+                ];
+
+                add_nested_file_op(&mut section, path, op_data);
             }
 
             FileOp::DeleteFile { path, old_snapshot } => {
-                section.add_field_multi(
-                    "op",
-                    vec![
-                        VsfType::u3(2),                                 // Op type: 2=delete file
-                        VsfType::l(path.to_string_lossy().to_string()), // File path
-                        VsfType::hp(old_snapshot.to_vec()), // Old snapshot hash (provenance)
-                    ],
-                );
+                let op_data = vec![
+                    VsfType::u3(2), // Op type: 2=delete file
+                    VsfType::hp(old_snapshot.to_vec()), // Old snapshot hash (provenance)
+                ];
+
+                add_nested_file_op(&mut section, path, op_data);
             }
 
             FileOp::RenameFile { from, to } => {
-                section.add_field_multi(
-                    "op",
+                // For rename, we need both paths - store in a "renames" subsection
+                let rename_section = if !section.has_subsection("renames") {
+                    let s = VsfSection::new("renames");
+                    section.add_subsection(s);
+                    section.get_mut_subsection("renames").unwrap()
+                } else {
+                    section.get_mut_subsection("renames").unwrap()
+                };
+
+                rename_section.add_field_multi(
+                    "r",
                     vec![
-                        VsfType::u3(3),                                 // Op type: 3=rename file
-                        VsfType::l(from.to_string_lossy().to_string()), // Source path
+                        VsfType::u3(3), // Op type: 3=rename file
+                        VsfType::l(from.to_string_lossy().to_string()), // Source path (keep flat for renames)
                         VsfType::l(to.to_string_lossy().to_string()),   // Dest path
                     ],
                 );

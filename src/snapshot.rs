@@ -1,28 +1,32 @@
-//! Patch creation - the heart of cairn
+//! Patch creation - the heart of cairn (blob-based architecture)
 //!
 //! Creates patches by:
-//! 1. Scanning working directory for tracked files
-//! 2. Computing deltas against previous state
-//! 3. Encoding patch with VSF
+//! 1. Storing each file as a blob in .cairn/blobs/
+//! 2. Creating a tree mapping paths → blob hashes
+//! 3. Creating a patch referencing the tree
 //! 4. Updating repository state
 
-use crate::diff;
-use crate::patch::{Patch, get_author_id};
-use crate::snapshot_vsf;
+use crate::blob;
+use crate::hash_encoding::base58_encode;
+use crate::patch_storage::{CommitInfo, create_commit};
 use crate::state::RepositoryState;
+use crate::tree;
 use anyhow::{Context, Result};
 use blake3::Hash;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use vsf::types::eagle_time;
-use vsf::verification::compute_provenance_hash;
 
-/// Create a patch from pre-captured file state
+/// Create a patch from pre-captured file state (blob-based architecture)
 ///
 /// This is used by cargo-cairn to create a patch from files that were
 /// captured BEFORE the build started, ensuring the patch matches exactly
 /// what was compiled.
+///
+/// Workflow:
+/// 1. Store each file as a blob in .cairn/blobs/
+/// 2. Create a tree mapping paths → blob hashes
+/// 3. Create a patch referencing the tree
 pub fn create_snapshot_from_files(
     cairn_dir: &PathBuf,
     message: String,
@@ -33,69 +37,61 @@ pub fn create_snapshot_from_files(
     let mut repo_state =
         RepositoryState::load(cairn_dir).context("Failed to load repository state")?;
 
-    // Create snapshot VSF for current state (new snapshot)
-    let new_snapshot = snapshot_vsf::create_snapshot(&current_files, cairn_dir)
-        .context("Failed to create new snapshot VSF")?;
-
-    // Get old snapshot hash from repository state
-    let old_snapshot = if repo_state.is_empty() {
-        // No previous snapshot - create empty one
-        let empty_files = HashMap::new();
-        snapshot_vsf::create_snapshot(&empty_files, cairn_dir)
-            .context("Failed to create empty initial snapshot")?
-    } else {
-        repo_state.latest_snapshot
-    };
-
-    // Compute delta operations on x-encoded snapshots
-    let operations = diff::compute_diff(cairn_dir, &old_snapshot, &new_snapshot)
-        .context("Failed to compute delta on snapshots")?;
-
-    if operations.is_empty() {
-        println!("No changes detected - skipping patch");
-        return Ok(repo_state.head.clone());
+    // 1. Store all files as blobs and get their hashes
+    let mut file_to_blob = HashMap::new();
+    for (path, content) in &current_files {
+        let blob_hash = blob::store_blob(content)
+            .with_context(|| format!("Failed to store blob for {:?}", path))?;
+        file_to_blob.insert(path.clone(), blob_hash);
     }
 
-    // Create patch - get current Eagle Time as oscillation count
-    let timestamp = eagle_time::eagle_time_oscillations();
-    let parent = if repo_state.is_empty() {
+    // 2. Create tree from file→blob mappings
+    let tree_hp = tree::create_tree(&file_to_blob)
+        .context("Failed to create tree")?;
+
+    // 3. Get parent commit hash (if exists)
+    let parent_commit_hp = if repo_state.is_empty() {
         None
     } else {
-        // Decode parent patch ID from base64url to get the raw hash
-        use base64::Engine;
-        let parent_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&repo_state.head)
+        // Decode parent patch ID from base58 to get the raw hash
+        let parent_bytes = crate::hash_encoding::base58_decode(&repo_state.head)
             .context("Failed to decode parent patch ID")?;
-        let parent_hash: [u8; 32] = parent_bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Parent patch ID must be 32 bytes"))?;
+        if parent_bytes.len() != 32 {
+            anyhow::bail!("Parent patch ID must be 32 bytes");
+        }
+        let mut parent_hash = [0u8; 32];
+        parent_hash.copy_from_slice(&parent_bytes);
         Some(parent_hash)
     };
 
-    let patch = Patch::new(
-        get_author_id(),
-        parent,
-        timestamp as usize,
+    // 4. Check if there are any changes (compare tree hashes)
+    if let Some(parent_hp) = parent_commit_hp {
+        let parent_commit = crate::patch_storage::load_commit(&parent_hp)
+            .context("Failed to load parent commit")?;
+
+        if parent_commit.tree_hp == tree_hp {
+            println!("No changes detected - skipping patch");
+            return Ok(repo_state.head.clone());
+        }
+    }
+
+    // 5. Create commit with tree reference
+    let commit_info = CommitInfo {
         message,
-        operations,
-        *build_hash.as_bytes(),
-    );
+        build_hash: *build_hash.as_bytes(),
+        tree_hp,
+        parent_commit_hp,
+        file_diffs: None,  // TODO: Compute diffs for space optimization
+    };
 
-    // Encode patch to VSF
-    let patch_bytes = patch.encode_vsf().context("Failed to encode patch")?;
+    let commit_hp = create_commit(commit_info)
+        .context("Failed to create commit")?;
 
-    // Extract VSF provenance hash and encode as base64url for filename
-    let provenance_hash = compute_provenance_hash(&patch_bytes)
-        .map_err(|e| anyhow::anyhow!("Failed to compute provenance hash: {}", e))?;
-    let patch_id = base64_url_encode(&provenance_hash);
+    // 6. Encode commit hash as base58 for the patch ID
+    let patch_id = base58_encode(&commit_hp);
 
-    // Save patch file
-    let patch_path = cairn_dir.join("patches").join(&patch_id);
-    fs::write(&patch_path, patch_bytes)
-        .with_context(|| format!("Failed to write patch file: {:?}", patch_path))?;
-
-    // Update repository state with new snapshot hash (already created above)
-    repo_state.add_patch(patch_id.clone(), new_snapshot);
+    // 7. Update repository state with new patch and tree hash
+    repo_state.add_patch(patch_id.clone(), tree_hp);
     repo_state
         .save(cairn_dir)
         .context("Failed to save repository state")?;
@@ -116,8 +112,8 @@ pub fn create_snapshot(cairn_dir: &PathBuf, message: String, build_hash: Hash) -
     let state = crate::state::RepositoryState::load(cairn_dir)
         .context("Failed to load repository state")?;
 
-    // Scan for changes
-    let scan_result = scan_working_directory(&state)
+    // Scan for changes (no cache on initial snapshot)
+    let scan_result = scan_working_directory(&state, None)
         .context("Failed to scan working directory")?;
 
     // Combine all files (added + modified) for snapshot
@@ -150,7 +146,14 @@ pub struct ScanResult {
 /// Only scans explicitly tracked paths (from state.tracked_paths).
 /// Only reads files that have potentially changed based on mtime+size comparison.
 /// Returns lists of added, modified, and deleted files for efficient patch creation.
-pub fn scan_working_directory(state: &crate::state::RepositoryState) -> Result<ScanResult> {
+/// Scan working directory for changes
+///
+/// The cache parameter is an optional in-memory cache from a previous scan.
+/// If provided, it enables fast mtime+size checks to avoid re-hashing unchanged files.
+pub fn scan_working_directory(
+    state: &crate::state::RepositoryState,
+    cache: Option<&crate::state::BuildCache>,
+) -> Result<ScanResult> {
     let current_dir = std::env::current_dir().context("Failed to get current directory")?;
     let mut added = HashMap::new();
     let mut modified = HashMap::new();
@@ -173,6 +176,7 @@ pub fn scan_working_directory(state: &crate::state::RepositoryState) -> Result<S
                 &full_path,
                 &current_dir,
                 state,
+                cache,
                 &mut added,
                 &mut modified,
                 &mut updated_cache,
@@ -207,6 +211,7 @@ pub fn scan_working_directory(state: &crate::state::RepositoryState) -> Result<S
                     path,
                     &current_dir,
                     state,
+                    cache,
                     &mut added,
                     &mut modified,
                     &mut updated_cache,
@@ -217,12 +222,16 @@ pub fn scan_working_directory(state: &crate::state::RepositoryState) -> Result<S
     }
 
     // Find deleted files (in cache but not on disk)
-    let deleted: Vec<PathBuf> = state
-        .files
-        .keys()
-        .filter(|path| !seen_paths.contains(*path))
-        .cloned()
-        .collect();
+    let deleted: Vec<PathBuf> = if let Some(cache) = cache {
+        cache
+            .files
+            .keys()
+            .filter(|path| !seen_paths.contains(*path))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     Ok(ScanResult {
         added,
@@ -236,7 +245,8 @@ pub fn scan_working_directory(state: &crate::state::RepositoryState) -> Result<S
 fn scan_file(
     path: &std::path::Path,
     current_dir: &std::path::Path,
-    state: &crate::state::RepositoryState,
+    _state: &crate::state::RepositoryState,
+    cache: Option<&crate::state::BuildCache>,
     added: &mut HashMap<PathBuf, Vec<u8>>,
     modified: &mut HashMap<PathBuf, Vec<u8>>,
     updated_cache: &mut HashMap<PathBuf, crate::state::FileInfo>,
@@ -260,58 +270,61 @@ fn scan_file(
     let mtime = metadata.modified()
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
-    // Check cache
-    if let Some(cached) = state.files.get(&relative_path) {
-        // File exists in cache - check if potentially changed
-        if cached.mtime == mtime && cached.size == size {
-            // mtime+size unchanged - definitely not modified, skip read
-            updated_cache.insert(relative_path.clone(), cached.clone());
+    // Check cache (if provided)
+    if let Some(cache) = cache {
+        if let Some(cached) = cache.files.get(&relative_path) {
+            // File exists in cache - check if potentially changed
+            if cached.mtime == mtime && cached.size == size {
+                // mtime+size unchanged - definitely not modified, skip read
+                updated_cache.insert(relative_path.clone(), cached.clone());
+                return Ok(());
+            }
+
+            // mtime or size changed - read and hash to confirm
+            let content = fs::read(path)
+                .with_context(|| format!("Failed to read file: {:?}", path))?;
+            let content_hash = *blake3::hash(&content).as_bytes();
+
+            if content_hash == cached.content_hash {
+                // Content actually unchanged - update mtime/size in cache
+                updated_cache.insert(
+                    relative_path,
+                    crate::state::FileInfo {
+                        mtime,
+                        size,
+                        content_hash,
+                    },
+                );
+            } else {
+                // Content changed - file modified
+                modified.insert(relative_path.clone(), content);
+                updated_cache.insert(
+                    relative_path,
+                    crate::state::FileInfo {
+                        mtime,
+                        size,
+                        content_hash,
+                    },
+                );
+            }
             return Ok(());
         }
-
-        // mtime or size changed - read and hash to confirm
-        let content = fs::read(path)
-            .with_context(|| format!("Failed to read file: {:?}", path))?;
-        let content_hash = *blake3::hash(&content).as_bytes();
-
-        if content_hash == cached.content_hash {
-            // Content actually unchanged - update mtime/size in cache
-            updated_cache.insert(
-                relative_path,
-                crate::state::FileInfo {
-                    mtime,
-                    size,
-                    content_hash,
-                },
-            );
-        } else {
-            // Content changed - file modified
-            modified.insert(relative_path.clone(), content);
-            updated_cache.insert(
-                relative_path,
-                crate::state::FileInfo {
-                    mtime,
-                    size,
-                    content_hash,
-                },
-            );
-        }
-    } else {
-        // File not in cache - new file
-        let content = fs::read(path)
-            .with_context(|| format!("Failed to read file: {:?}", path))?;
-        let content_hash = *blake3::hash(&content).as_bytes();
-
-        added.insert(relative_path.clone(), content);
-        updated_cache.insert(
-            relative_path,
-            crate::state::FileInfo {
-                mtime,
-                size,
-                content_hash,
-            },
-        );
     }
+
+    // File not in cache (or no cache provided) - treat as new file
+    let content = fs::read(path)
+        .with_context(|| format!("Failed to read file: {:?}", path))?;
+    let content_hash = *blake3::hash(&content).as_bytes();
+
+    added.insert(relative_path.clone(), content);
+    updated_cache.insert(
+        relative_path,
+        crate::state::FileInfo {
+            mtime,
+            size,
+            content_hash,
+        },
+    );
 
     Ok(())
 }
@@ -433,12 +446,6 @@ fn denormalize_name(name: &str) -> String {
     name.to_string()
 }
 
-/// Base64 URL-safe encoding (no padding)
-fn base64_url_encode(bytes: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,7 +477,7 @@ mod tests {
         // This test runs in the actual cairn project directory
         // which has src/ and Cargo.toml, so it should find files
         let state = crate::state::RepositoryState::new();
-        let result = scan_working_directory(&state).unwrap();
+        let result = scan_working_directory(&state, None).unwrap();
 
         // The cairn project has src/ and Cargo.toml (tracked by default)
         // So we should find at least those tracked paths
@@ -490,14 +497,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_base64_url_encode() {
-        let input = b"hello world";
-        let encoded = base64_url_encode(input);
-
-        // Should be URL-safe (no +, /, =)
-        assert!(!encoded.contains('+'));
-        assert!(!encoded.contains('/'));
-        assert!(!encoded.contains('='));
-    }
 }

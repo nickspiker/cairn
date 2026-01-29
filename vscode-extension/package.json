@@ -62,8 +62,8 @@
         "category": "Cairn"
       },
       {
-        "command": "cairn.showPatch",
-        "title": "Cairn: Show Patch",
+        "command": "cairn.showCommit",
+        "title": "Cairn: Show Commit",
         "category": "Cairn"
       }
     ],

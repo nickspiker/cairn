@@ -82,7 +82,7 @@ Patches (newest first):
   #0   swift-ocean-light-paper-wind
 ```
 
-**Key insight:** `cargo cairn` snapshots your code BEFORE the build starts, then only commits the patch if the build succeeds. This guarantees the patch matches exactly what was compiled.
+**Key insight:** `cargo cairn` snapshots your code BEFORE the build starts, then only saves the patch if the build succeeds. This guarantees the patch matches exactly what was compiled.
 
 ---
 
@@ -261,4 +261,5 @@ MIT or Apache-2.0, your choice.
 ---
 
 **Cairn: Because every successful build deserves to be saved.**
+# Test
 # Test

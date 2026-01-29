@@ -27,6 +27,8 @@ use vsf::types::eagle_time;
 use vsf::verification::compute_provenance_hash;
 use vsf::{VsfBuilder, VsfSection, VsfType};
 
+use crate::hash_encoding::base58_encode;
+
 /// Create a snapshot VSF file from a HashMap of files
 ///
 /// Returns the provenance hash of the snapshot (used to identify it)
@@ -55,7 +57,7 @@ pub fn create_snapshot(files: &HashMap<PathBuf, Vec<u8>>, cairn_dir: &Path) -> R
     let snapshots_dir = cairn_dir.join("snapshots");
     fs::create_dir_all(&snapshots_dir).context("Failed to create snapshots directory")?;
 
-    let snapshot_path = snapshots_dir.join(format!("{}.vsf", hex::encode(&provenance)));
+    let snapshot_path = snapshots_dir.join(format!("{}.vsf", base58_encode(&provenance)));
     fs::write(&snapshot_path, &vsf_bytes).context("Failed to write snapshot VSF")?;
 
     Ok(provenance)
@@ -87,7 +89,7 @@ fn build_file_tree(files: &HashMap<PathBuf, Vec<u8>>) -> Result<VsfSection> {
 ///
 /// Uses hex encoding for the full path to avoid any character conflicts
 /// Hex encoding only uses 0-9a-f, which are all valid lowercase VSF characters
-fn path_to_vsf_label(path: &Path) -> Result<String> {
+pub fn path_to_vsf_label(path: &Path) -> Result<String> {
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow!("Invalid UTF-8 in path: {:?}", path))?;
@@ -102,7 +104,7 @@ fn path_to_vsf_label(path: &Path) -> Result<String> {
 }
 
 /// Convert a VSF label back to a file path
-fn vsf_label_to_path(label: &str) -> Result<PathBuf> {
+pub fn vsf_label_to_path(label: &str) -> Result<PathBuf> {
     // Remove "f_" prefix
     let encoded = label
         .strip_prefix("f_")
@@ -154,11 +156,11 @@ pub fn read_file_from_snapshot(
     // Load snapshot VSF
     let snapshot_path = cairn_dir
         .join("snapshots")
-        .join(format!("{}.vsf", hex::encode(snapshot_hash)));
+        .join(format!("{}.vsf", base58_encode(snapshot_hash)));
 
     let bytes = fs::read(&snapshot_path).context(format!(
         "Failed to load snapshot: {}",
-        hex::encode(snapshot_hash)
+        base58_encode(snapshot_hash)
     ))?;
 
     // Parse VSF header
@@ -201,11 +203,66 @@ pub fn read_file_from_snapshot(
     }
 }
 
+/// Load all files from a snapshot and decode them
+///
+/// Returns a HashMap of file paths to decoded content (raw bytes)
+pub fn load_snapshot_files(
+    cairn_dir: &Path,
+    snapshot_hash: &[u8; 32],
+) -> Result<HashMap<PathBuf, Vec<u8>>> {
+    // Load snapshot VSF
+    let snapshot_path = cairn_dir
+        .join("snapshots")
+        .join(format!("{}.vsf", base58_encode(snapshot_hash)));
+
+    let bytes = fs::read(&snapshot_path).context(format!(
+        "Failed to load snapshot: {}",
+        base58_encode(snapshot_hash)
+    ))?;
+
+    // Parse VSF header
+    let (header, _header_len) = vsf::VsfHeader::decode(&bytes)
+        .map_err(|e| anyhow!("Failed to decode VSF header: {}", e))?;
+
+    // Find the "files" section
+    let files_field = header
+        .fields
+        .iter()
+        .find(|f| f.name == "files")
+        .context("Snapshot missing 'files' section")?;
+
+    // Parse the files section
+    let mut ptr = files_field.offset_bytes;
+    let files_section = VsfSection::parse(&bytes, &mut ptr)
+        .map_err(|e| anyhow!("Failed to parse files section: {}", e))?;
+
+    // Decode all files
+    let mut result = HashMap::new();
+
+    for field in &files_section.fields {
+        // Convert hex label back to path
+        let path = vsf_label_to_path(&field.name)?;
+
+        // Decode content
+        if let Some(value) = field.values.first() {
+            let content = match value {
+                VsfType::x(text) => text.as_bytes().to_vec(),
+                VsfType::v(b'b', bytes) => bytes.clone(),
+                _ => continue, // Skip unknown types
+            };
+
+            result.insert(path, content);
+        }
+    }
+
+    Ok(result)
+}
+
 /// Check if a snapshot exists
 pub fn snapshot_exists(cairn_dir: &Path, snapshot_hash: &[u8; 32]) -> bool {
     let snapshot_path = cairn_dir
         .join("snapshots")
-        .join(format!("{}.vsf", hex::encode(snapshot_hash)));
+        .join(format!("{}.vsf", base58_encode(snapshot_hash)));
 
     snapshot_path.exists()
 }
@@ -222,11 +279,11 @@ pub fn extract_encoded_file(
 ) -> Result<Vec<u8>> {
     let snapshot_path = cairn_dir
         .join("snapshots")
-        .join(format!("{}.vsf", hex::encode(snapshot_hash)));
+        .join(format!("{}.vsf", base58_encode(snapshot_hash)));
 
     let bytes = fs::read(&snapshot_path).context(format!(
         "Failed to load snapshot: {}",
-        hex::encode(snapshot_hash)
+        base58_encode(snapshot_hash)
     ))?;
 
     // Parse VSF header
@@ -283,11 +340,11 @@ pub fn extract_encoded_files(
 ) -> Result<HashMap<PathBuf, Vec<u8>>> {
     let snapshot_path = cairn_dir
         .join("snapshots")
-        .join(format!("{}.vsf", hex::encode(snapshot_hash)));
+        .join(format!("{}.vsf", base58_encode(snapshot_hash)));
 
     let bytes = fs::read(&snapshot_path).context(format!(
         "Failed to load snapshot: {}",
-        hex::encode(snapshot_hash)
+        base58_encode(snapshot_hash)
     ))?;
 
     // Parse VSF header
