@@ -76,6 +76,45 @@ class CairnTreeProvider implements vscode.TreeDataProvider<CairnTreeItem> {
         return [];
     }
 
+    private getCurrentPatchHash(workspaceRoot: string): string | null {
+        const statePath = path.join(workspaceRoot, '.cairn', 'state.vsf');
+        if (!fs.existsSync(statePath)) {
+            outputChannel.appendLine('[STATE] state.vsf not found');
+            return null;
+        }
+
+        try {
+            const stateContent = fs.readFileSync(statePath, 'utf8');
+            // Simple extraction: look for the HEAD patch hash
+            // state.vsf format has patches listed, and we want the first one (newest)
+            const patchesDir = path.join(workspaceRoot, '.cairn', 'patches');
+            if (!fs.existsSync(patchesDir)) {
+                return null;
+            }
+
+            // Get the most recently modified patch file as a fallback heuristic
+            const patchFiles = fs.readdirSync(patchesDir, { withFileTypes: true })
+                .filter(dirent => dirent.isFile() && dirent.name.endsWith('.vsf'))
+                .map(dirent => {
+                    const filePath = path.join(patchesDir, dirent.name);
+                    const stats = fs.statSync(filePath);
+                    return { name: dirent.name.replace('.vsf', ''), mtime: stats.mtime };
+                })
+                .sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+
+            if (patchFiles.length > 0) {
+                const currentHash = patchFiles[0].name;
+                outputChannel.appendLine(`[STATE] Current patch (by mtime): ${currentHash.substring(0, 8)}`);
+                return currentHash;
+            }
+
+            return null;
+        } catch (err) {
+            outputChannel.appendLine(`[STATE] Error reading state: ${err}`);
+            return null;
+        }
+    }
+
     private getPatches(): CairnTreeItem[] {
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders) {
@@ -83,22 +122,26 @@ class CairnTreeProvider implements vscode.TreeDataProvider<CairnTreeItem> {
             return [];
         }
 
-        const commitsDir = path.join(workspaceFolders[0].uri.fsPath, '.cairn', 'commits');
-        outputChannel.appendLine(`[PATCHES] Reading from: ${commitsDir}`);
+        const workspaceRoot = workspaceFolders[0].uri.fsPath;
+        const patchesDir = path.join(workspaceRoot, '.cairn', 'patches');
+        outputChannel.appendLine(`[PATCHES] Reading from: ${patchesDir}`);
 
-        if (!fs.existsSync(commitsDir)) {
+        if (!fs.existsSync(patchesDir)) {
             outputChannel.appendLine('[PATCHES] Directory does not exist');
             return [new CairnTreeItem('No patches yet', vscode.TreeItemCollapsibleState.None)];
         }
 
+        // Get current patch hash
+        const currentPatchHash = this.getCurrentPatchHash(workspaceRoot);
+
         try {
-            const files = fs.readdirSync(commitsDir, { withFileTypes: true });
+            const files = fs.readdirSync(patchesDir, { withFileTypes: true });
             outputChannel.appendLine(`[PATCHES] Found ${files.length} files`);
 
             const patches = files
                 .filter(dirent => dirent.isFile() && dirent.name.endsWith('.vsf'))
                 .map(dirent => {
-                    const filePath = path.join(commitsDir, dirent.name);
+                    const filePath = path.join(patchesDir, dirent.name);
                     const stats = fs.statSync(filePath);
                     return {
                         name: dirent.name.replace('.vsf', ''),
@@ -109,10 +152,13 @@ class CairnTreeProvider implements vscode.TreeDataProvider<CairnTreeItem> {
                 .map(patch => {
                     const shortHash = patch.name.substring(0, 8);
                     const timeStr = patch.mtime.toLocaleString();
-                    // TODO: Get current patch from state.vsf to show ⚪ for current, ⚫ for others
-                    const icon = '⚫'; // Will be ⚪ for current patch
+                    const isCurrent = currentPatchHash === patch.name;
+                    const icon = isCurrent ? '⚪' : '⚫';
+                    const label = isCurrent
+                        ? `${icon} ${shortHash} (${timeStr}) [CURRENT]`
+                        : `${icon} ${shortHash} (${timeStr})`;
                     return new CairnTreeItem(
-                        `${icon} ${shortHash} (${timeStr})`,
+                        label,
                         vscode.TreeItemCollapsibleState.None,
                         {
                             command: 'cairn.jumpPatch',
