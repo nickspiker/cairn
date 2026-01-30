@@ -86,46 +86,26 @@ class CairnTreeProvider implements vscode.TreeDataProvider<CairnTreeItem> {
 
     private getCurrentPatchHash(workspaceRoot: string): string | null {
         try {
-            const { execSync } = require('child_process');
-            // Run cairn list and parse output to find CURRENT patch
-            const output = execSync('cairn list', {
-                cwd: workspaceRoot,
-                encoding: 'utf8',
-                timeout: 5000,
-                stdio: ['pipe', 'pipe', 'pipe']
-            });
+            // Simple heuristic: newest patch by mtime is current
+            // This avoids blocking execSync calls that cause freezing
+            const patchesDir = path.join(workspaceRoot, '.cairn', 'patches');
+            if (!fs.existsSync(patchesDir)) {
+                return null;
+            }
 
-            // Parse output to find line with "CURRENT"
-            // Format: "#N   name-here (CURRENT, NEWEST)"
-            const lines = output.split('\n');
-            for (const line of lines) {
-                if (line.includes('CURRENT')) {
-                    // Extract the patch name (second field)
-                    const match = line.match(/^\s*#\d+\s+(\S+)/);
-                    if (match) {
-                        const patchName = match[1];
-                        outputChannel.appendLine(`[STATE] Current patch: ${patchName}`);
+            const patchFiles = fs.readdirSync(patchesDir, { withFileTypes: true })
+                .filter(dirent => dirent.isFile() && dirent.name.endsWith('.vsf'))
+                .map(dirent => {
+                    const filePath = path.join(patchesDir, dirent.name);
+                    const stats = fs.statSync(filePath);
+                    return { hash: dirent.name.replace('.vsf', ''), mtime: stats.mtime };
+                })
+                .sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
 
-                        // Convert mnemonic name to hash by finding the file
-                        const patchesDir = path.join(workspaceRoot, '.cairn', 'patches');
-                        const files = fs.readdirSync(patchesDir);
-
-                        // For now, just return the newest patch by mtime
-                        // TODO: Map mnemonic names to hashes properly
-                        const patchFiles = files
-                            .filter((name: string) => name.endsWith('.vsf'))
-                            .map((name: string) => {
-                                const filePath = path.join(patchesDir, name);
-                                const stats = fs.statSync(filePath);
-                                return { hash: name.replace('.vsf', ''), mtime: stats.mtime };
-                            })
-                            .sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
-
-                        if (patchFiles.length > 0) {
-                            return patchFiles[0].hash;
-                        }
-                    }
-                }
+            if (patchFiles.length > 0) {
+                const currentHash = patchFiles[0].hash;
+                outputChannel.appendLine(`[STATE] Current patch (newest by mtime): ${currentHash.substring(0, 8)}`);
+                return currentHash;
             }
 
             return null;
