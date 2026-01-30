@@ -193,6 +193,10 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(treeView);
     outputChannel.appendLine('[INIT] Tree view created and registered');
 
+    // Create status bar item for command feedback (must be before commands that use it)
+    const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    context.subscriptions.push(statusBar);
+
     // Register refresh command
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.refresh', () => {
@@ -366,10 +370,7 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
-    // Create status bar item for patch switching feedback
-    const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-    context.subscriptions.push(statusBar);
-
+    // Jump patch command
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.jumpPatch', async (patchHash: string) => {
             outputChannel.appendLine(`[CMD] JUMP PATCH command triggered for: ${patchHash}`);
