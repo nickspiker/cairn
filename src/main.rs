@@ -61,7 +61,7 @@ enum Commands {
     },
 
     /// Delete the .cairn directory and all patch history
-    Clear,
+    Clean,
 
     /// Create a patch manually (for testing)
     #[command(hide = true)]
@@ -88,8 +88,8 @@ fn main() -> Result<()> {
         Commands::Jump { patch_id } => {
             cmd_jump(&patch_id)?;
         }
-        Commands::Clear => {
-            cmd_clear()?;
+        Commands::Clean => {
+            cmd_clean()?;
         }
         Commands::Snapshot { message } => {
             cmd_snapshot(&message)?;
@@ -253,12 +253,12 @@ fn cmd_jump(patch_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_clear() -> Result<()> {
+fn cmd_clean() -> Result<()> {
     let cairn_dir = PathBuf::from(".cairn");
 
     // Check if .cairn exists
     if !cairn_dir.exists() {
-        println!("No .cairn directory found - nothing to clear");
+        println!("No .cairn directory found - nothing to clean");
         return Ok(());
     }
 
@@ -283,7 +283,7 @@ fn cmd_clear() -> Result<()> {
     println!("Removing .cairn directory...");
     fs::remove_dir_all(&cairn_dir).context("Failed to remove .cairn directory")?;
 
-    println!("✓ Cleared cairn repository");
+    println!("✓ Cleaned cairn repository");
     Ok(())
 }
 

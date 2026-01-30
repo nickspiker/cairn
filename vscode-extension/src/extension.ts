@@ -392,34 +392,50 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('cairn.jumpPatch', async (patchHash: string) => {
             outputChannel.appendLine(`[CMD] JUMP PATCH command triggered for: ${patchHash}`);
 
-            // Confirm with user
-            const answer = await vscode.window.showWarningMessage(
-                `Switch to patch ${patchHash.substring(0, 8)}? This will restore your workspace to that patch state.`,
-                'Switch', 'Cancel'
-            );
+            // Execute silently without terminal spam
+            const { spawn } = require('child_process');
+            const shortHash = patchHash.substring(0, 8);
 
-            if (answer !== 'Switch') {
-                outputChannel.appendLine('[CMD] Jump cancelled by user');
-                return;
-            }
+            vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: `Switching to patch ${shortHash}...`,
+                cancellable: false
+            }, async () => {
+                return new Promise<void>((resolve, reject) => {
+                    const proc = spawn('cairn', ['jump', patchHash], {
+                        cwd: vscode.workspace.workspaceFolders?.[0].uri.fsPath
+                    });
 
-            // Use cairn jump command to switch patches
-            const task = new vscode.Task(
-                { type: 'shell' },
-                vscode.TaskScope.Workspace,
-                'Switch Patch',
-                'cairn',
-                new vscode.ShellExecution(`cairn jump ${patchHash}`)
-            );
-            task.presentationOptions = {
-                reveal: vscode.TaskRevealKind.Always,
-                panel: vscode.TaskPanelKind.Dedicated
-            };
-            await vscode.tasks.executeTask(task);
-            outputChannel.appendLine('[CMD] Jump task started');
+                    let stdout = '';
+                    let stderr = '';
 
-            // Refresh tree after jump
-            setTimeout(() => treeProvider.refresh(), 1000);
+                    proc.stdout.on('data', (data: Buffer) => {
+                        stdout += data.toString();
+                        outputChannel.appendLine(`[JUMP] ${data.toString().trim()}`);
+                    });
+
+                    proc.stderr.on('data', (data: Buffer) => {
+                        stderr += data.toString();
+                        outputChannel.appendLine(`[JUMP ERROR] ${data.toString().trim()}`);
+                    });
+
+                    proc.on('close', (code: number) => {
+                        if (code === 0) {
+                            vscode.window.showInformationMessage(`✓ Switched to patch ${shortHash}`);
+                            outputChannel.appendLine('[CMD] Jump completed successfully');
+                            treeProvider.refresh();
+                            resolve();
+                        } else {
+                            vscode.window.showErrorMessage(`Failed to switch to patch ${shortHash}`);
+                            outputChannel.appendLine(`[CMD] Jump failed with code ${code}`);
+                            if (stderr) {
+                                outputChannel.appendLine(`[CMD] Error: ${stderr}`);
+                            }
+                            reject(new Error(`Jump failed with code ${code}`));
+                        }
+                    });
+                });
+            });
         })
     );
 
