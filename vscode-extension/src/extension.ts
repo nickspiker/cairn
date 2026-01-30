@@ -388,53 +388,51 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    // Create status bar item for patch switching feedback
+    const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    context.subscriptions.push(statusBar);
+
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.jumpPatch', async (patchHash: string) => {
             outputChannel.appendLine(`[CMD] JUMP PATCH command triggered for: ${patchHash}`);
 
-            // Execute silently without terminal spam
             const { spawn } = require('child_process');
             const shortHash = patchHash.substring(0, 8);
 
-            vscode.window.withProgress({
-                location: vscode.ProgressLocation.Notification,
-                title: `Switching to patch ${shortHash}...`,
-                cancellable: false
-            }, async () => {
-                return new Promise<void>((resolve, reject) => {
-                    const proc = spawn('cairn', ['jump', patchHash], {
-                        cwd: vscode.workspace.workspaceFolders?.[0].uri.fsPath
-                    });
+            // Update status bar - no blocking dialogs!
+            statusBar.text = `$(sync~spin) Switching to ${shortHash}...`;
+            statusBar.show();
 
-                    let stdout = '';
-                    let stderr = '';
+            const proc = spawn('cairn', ['jump', patchHash], {
+                cwd: vscode.workspace.workspaceFolders?.[0].uri.fsPath
+            });
 
-                    proc.stdout.on('data', (data: Buffer) => {
-                        stdout += data.toString();
-                        outputChannel.appendLine(`[JUMP] ${data.toString().trim()}`);
-                    });
+            let stderr = '';
 
-                    proc.stderr.on('data', (data: Buffer) => {
-                        stderr += data.toString();
-                        outputChannel.appendLine(`[JUMP ERROR] ${data.toString().trim()}`);
-                    });
+            proc.stdout.on('data', (data: Buffer) => {
+                outputChannel.appendLine(`[JUMP] ${data.toString().trim()}`);
+            });
 
-                    proc.on('close', (code: number) => {
-                        if (code === 0) {
-                            vscode.window.showInformationMessage(`✓ Switched to patch ${shortHash}`);
-                            outputChannel.appendLine('[CMD] Jump completed successfully');
-                            treeProvider.refresh();
-                            resolve();
-                        } else {
-                            vscode.window.showErrorMessage(`Failed to switch to patch ${shortHash}`);
-                            outputChannel.appendLine(`[CMD] Jump failed with code ${code}`);
-                            if (stderr) {
-                                outputChannel.appendLine(`[CMD] Error: ${stderr}`);
-                            }
-                            reject(new Error(`Jump failed with code ${code}`));
-                        }
-                    });
-                });
+            proc.stderr.on('data', (data: Buffer) => {
+                stderr += data.toString();
+                outputChannel.appendLine(`[JUMP ERROR] ${data.toString().trim()}`);
+            });
+
+            proc.on('close', (code: number) => {
+                if (code === 0) {
+                    statusBar.text = `$(check) Switched to ${shortHash}`;
+                    outputChannel.appendLine('[CMD] Jump completed successfully');
+                    treeProvider.refresh();
+                    // Auto-hide after 3 seconds
+                    setTimeout(() => statusBar.hide(), 3000);
+                } else {
+                    statusBar.text = `$(x) Failed to switch to ${shortHash}`;
+                    outputChannel.appendLine(`[CMD] Jump failed with code ${code}`);
+                    if (stderr) {
+                        outputChannel.appendLine(`[CMD] Error: ${stderr}`);
+                    }
+                    setTimeout(() => statusBar.hide(), 5000);
+                }
             });
         })
     );
