@@ -229,127 +229,92 @@ export function activate(context: vscode.ExtensionContext) {
         outputChannel.appendLine('[INIT] File watcher registered for .cairn/patches');
     }
 
-    // Register build commands
+    // Helper function for silent command execution
+    const executeSilent = (command: string, args: string[], statusBar: vscode.StatusBarItem, actionName: string, refreshAfter: boolean = false) => {
+        return new Promise<void>((resolve, reject) => {
+            const { spawn } = require('child_process');
+
+            statusBar.text = `$(sync~spin) ${actionName}...`;
+            statusBar.show();
+            outputChannel.appendLine(`[CMD] Executing: ${command} ${args.join(' ')}`);
+
+            const proc = spawn(command, args, {
+                cwd: vscode.workspace.workspaceFolders?.[0].uri.fsPath
+            });
+
+            let stderr = '';
+
+            proc.stdout.on('data', (data: Buffer) => {
+                outputChannel.appendLine(data.toString().trim());
+            });
+
+            proc.stderr.on('data', (data: Buffer) => {
+                stderr += data.toString();
+                outputChannel.appendLine(`[ERROR] ${data.toString().trim()}`);
+            });
+
+            proc.on('close', (code: number) => {
+                if (code === 0) {
+                    statusBar.text = `$(check) ${actionName} succeeded`;
+                    outputChannel.appendLine(`[CMD] ${actionName} completed successfully`);
+                    if (refreshAfter) {
+                        treeProvider.refresh();
+                    }
+                    setTimeout(() => statusBar.hide(), 3000);
+                    resolve();
+                } else {
+                    statusBar.text = `$(x) ${actionName} failed`;
+                    outputChannel.appendLine(`[CMD] ${actionName} failed with code ${code}`);
+                    if (stderr) {
+                        outputChannel.appendLine(`[CMD] Error: ${stderr}`);
+                    }
+                    setTimeout(() => statusBar.hide(), 5000);
+                    reject(new Error(`${actionName} failed with code ${code}`));
+                }
+            });
+        });
+    };
+
+    // Register build commands - all use silent execution with status bar
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.run', async () => {
             outputChannel.appendLine('[CMD] RUN command triggered');
-            const task = new vscode.Task(
-                { type: 'shell' },
-                vscode.TaskScope.Workspace,
-                'Cairn Run',
-                'cairn',
-                new vscode.ShellExecution('cargo cairn run')
-            );
-            task.presentationOptions = {
-                reveal: vscode.TaskRevealKind.Always,
-                panel: vscode.TaskPanelKind.Dedicated
-            };
-            outputChannel.appendLine('[CMD] Executing run task');
-            await vscode.tasks.executeTask(task);
-            outputChannel.appendLine('[CMD] Run task started');
+            await executeSilent('cargo', ['cairn', 'run'], statusBar, 'Run');
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.runRelease', async () => {
             outputChannel.appendLine('[CMD] RUN RELEASE command triggered');
-            const task = new vscode.Task(
-                { type: 'shell' },
-                vscode.TaskScope.Workspace,
-                'Cairn Run (Release)',
-                'cairn',
-                new vscode.ShellExecution('cargo cairn run --release')
-            );
-            task.presentationOptions = {
-                reveal: vscode.TaskRevealKind.Always,
-                panel: vscode.TaskPanelKind.Dedicated
-            };
-            await vscode.tasks.executeTask(task);
-            outputChannel.appendLine('[CMD] Run release task started');
+            await executeSilent('cargo', ['cairn', 'run', '--release'], statusBar, 'Run (Release)');
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.build', async () => {
             outputChannel.appendLine('[CMD] BUILD command triggered');
-            const task = new vscode.Task(
-                { type: 'shell' },
-                vscode.TaskScope.Workspace,
-                'Cairn Build',
-                'cairn',
-                new vscode.ShellExecution('cargo cairn build')
-            );
-            task.presentationOptions = {
-                reveal: vscode.TaskRevealKind.Always,
-                panel: vscode.TaskPanelKind.Dedicated
-            };
-            outputChannel.appendLine('[CMD] Executing build task');
-            await vscode.tasks.executeTask(task);
-            outputChannel.appendLine('[CMD] Build task started, scheduling refresh');
-            // Refresh patches after build completes
-            setTimeout(() => {
-                outputChannel.appendLine('[CMD] Refreshing after build timeout');
-                treeProvider.refresh();
-            }, 1000);
+            await executeSilent('cargo', ['cairn', 'build'], statusBar, 'Build', true);
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.buildRelease', async () => {
             outputChannel.appendLine('[CMD] BUILD RELEASE command triggered');
-            const task = new vscode.Task(
-                { type: 'shell' },
-                vscode.TaskScope.Workspace,
-                'Cairn Build (Release)',
-                'cairn',
-                new vscode.ShellExecution('cargo cairn build --release')
-            );
-            task.presentationOptions = {
-                reveal: vscode.TaskRevealKind.Always,
-                panel: vscode.TaskPanelKind.Dedicated
-            };
-            await vscode.tasks.executeTask(task);
-            outputChannel.appendLine('[CMD] Build release task started, scheduling refresh');
-            setTimeout(() => treeProvider.refresh(), 1000);
+            await executeSilent('cargo', ['cairn', 'build', '--release'], statusBar, 'Build (Release)', true);
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.check', async () => {
             outputChannel.appendLine('[CMD] CHECK command triggered');
-            const task = new vscode.Task(
-                { type: 'shell' },
-                vscode.TaskScope.Workspace,
-                'Cairn Check',
-                'cairn',
-                new vscode.ShellExecution('cargo cairn check')
-            );
-            task.presentationOptions = {
-                reveal: vscode.TaskRevealKind.Always,
-                panel: vscode.TaskPanelKind.Dedicated
-            };
-            await vscode.tasks.executeTask(task);
-            outputChannel.appendLine('[CMD] Check task started');
+            await executeSilent('cargo', ['cairn', 'check'], statusBar, 'Check');
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.test', async () => {
             outputChannel.appendLine('[CMD] TEST command triggered');
-            const task = new vscode.Task(
-                { type: 'shell' },
-                vscode.TaskScope.Workspace,
-                'Cairn Test',
-                'cairn',
-                new vscode.ShellExecution('cargo cairn test')
-            );
-            task.presentationOptions = {
-                reveal: vscode.TaskRevealKind.Always,
-                panel: vscode.TaskPanelKind.Dedicated
-            };
-            await vscode.tasks.executeTask(task);
-            outputChannel.appendLine('[CMD] Test task started, scheduling refresh');
-            setTimeout(() => treeProvider.refresh(), 1000);
+            await executeSilent('cargo', ['cairn', 'test'], statusBar, 'Test', true);
         })
     );
 
@@ -369,22 +334,35 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            const task = new vscode.Task(
-                { type: 'shell' },
-                vscode.TaskScope.Workspace,
-                'Cairn Clear',
-                'cairn',
-                new vscode.ShellExecution('echo y | cairn clear')
-            );
-            task.presentationOptions = {
-                reveal: vscode.TaskRevealKind.Always,
-                panel: vscode.TaskPanelKind.Dedicated
-            };
-            await vscode.tasks.executeTask(task);
-            outputChannel.appendLine('[CMD] Clear task started');
+            // Execute with automatic "yes" response
+            const { spawn } = require('child_process');
+            statusBar.text = '$(sync~spin) Clearing cairn...';
+            statusBar.show();
 
-            // Refresh the tree after clearing
-            setTimeout(() => treeProvider.refresh(), 1000);
+            const proc = spawn('sh', ['-c', 'echo y | cairn clear'], {
+                cwd: vscode.workspace.workspaceFolders?.[0].uri.fsPath
+            });
+
+            proc.stdout.on('data', (data: Buffer) => {
+                outputChannel.appendLine(data.toString().trim());
+            });
+
+            proc.stderr.on('data', (data: Buffer) => {
+                outputChannel.appendLine(`[ERROR] ${data.toString().trim()}`);
+            });
+
+            proc.on('close', (code: number) => {
+                if (code === 0) {
+                    statusBar.text = '$(check) Cleared cairn';
+                    outputChannel.appendLine('[CMD] Clear completed');
+                    treeProvider.refresh();
+                    setTimeout(() => statusBar.hide(), 3000);
+                } else {
+                    statusBar.text = '$(x) Clear failed';
+                    outputChannel.appendLine(`[CMD] Clear failed with code ${code}`);
+                    setTimeout(() => statusBar.hide(), 5000);
+                }
+            });
         })
     );
 
