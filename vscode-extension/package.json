@@ -57,8 +57,8 @@
         "category": "Cairn"
       },
       {
-        "command": "cairn.clean",
-        "title": "Cairn: Clean",
+        "command": "cairn.clear",
+        "title": "Cairn: Clear",
         "category": "Cairn"
       },
       {

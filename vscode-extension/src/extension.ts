@@ -1,8 +1,10 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import { DaemonShmClient } from './shmClient';
 
 let outputChannel: vscode.OutputChannel;
+let shmClient: DaemonShmClient;
 
 class CairnTreeItem extends vscode.TreeItem {
     constructor(
@@ -178,10 +180,82 @@ class CairnTreeProvider implements vscode.TreeDataProvider<CairnTreeItem> {
     }
 }
 
+function findCairnBinary(): string {
+    const { execSync } = require('child_process');
+
+    // Try multiple locations
+    const candidates = [
+        'cairn', // In PATH
+        path.join(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '.', 'target/debug/cairn'),
+        path.join(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '.', 'target/release/cairn'),
+    ];
+
+    for (const candidate of candidates) {
+        try {
+            // Check if this is the shared memory version by testing for daemon subcommand
+            if (fs.existsSync(candidate)) {
+                return candidate;
+            }
+        } catch {
+            continue;
+        }
+    }
+
+    // Default to PATH
+    return 'cairn';
+}
+
+async function ensureDaemonRunning(): Promise<boolean> {
+    if (shmClient.isDaemonRunning()) {
+        outputChannel.appendLine('[DAEMON] Already running');
+        return true;
+    }
+
+    outputChannel.appendLine('[DAEMON] Not running, starting daemon...');
+
+    try {
+        const cairnBinary = findCairnBinary();
+        outputChannel.appendLine(`[DAEMON] Using binary: ${cairnBinary}`);
+
+        // Start daemon in background
+        const { spawn } = require('child_process');
+        const daemon = spawn(cairnBinary, ['daemon'], {
+            detached: true,
+            stdio: 'ignore'
+        });
+        daemon.unref(); // Allow parent to exit independently
+
+        // Wait a bit for daemon to initialize
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        if (shmClient.isDaemonRunning()) {
+            outputChannel.appendLine('[DAEMON] Started successfully');
+            return true;
+        } else {
+            outputChannel.appendLine('[DAEMON] Failed to start - shared memory not found');
+            return false;
+        }
+    } catch (error) {
+        outputChannel.appendLine(`[DAEMON] Failed to start: ${error}`);
+        return false;
+    }
+}
+
 export function activate(context: vscode.ExtensionContext) {
     outputChannel = vscode.window.createOutputChannel('Cairn');
     outputChannel.appendLine('=== Cairn extension activated ===');
     outputChannel.show();
+
+    // Initialize shared memory client
+    shmClient = new DaemonShmClient();
+    outputChannel.appendLine('[INIT] Shared memory client initialized');
+
+    // Auto-start daemon if not running
+    ensureDaemonRunning().then(running => {
+        if (!running) {
+            outputChannel.appendLine('[DAEMON] Warning: Failed to auto-start daemon');
+        }
+    });
 
     // Create tree view in sidebar
     const treeProvider = new CairnTreeProvider();
@@ -233,140 +307,139 @@ export function activate(context: vscode.ExtensionContext) {
         outputChannel.appendLine('[INIT] File watcher registered for .cairn/patches');
     }
 
-    // Helper function for silent command execution
-    const executeSilent = (command: string, args: string[], statusBar: vscode.StatusBarItem, actionName: string, refreshAfter: boolean = false) => {
-        return new Promise<void>((resolve, reject) => {
-            const { spawn } = require('child_process');
+    // Poll for daemon events and health check
+    let lastHealthCheck = Date.now();
+    const eventPollInterval = setInterval(() => {
+        try {
+            if (shmClient.isDaemonRunning()) {
+                const events = shmClient.pollEvents();
+                if (events !== 0) {
+                    outputChannel.appendLine(`[EVENTS] Received events: 0x${events.toString(16)}`);
 
-            statusBar.text = `$(sync~spin) ${actionName}...`;
-            statusBar.show();
-            outputChannel.appendLine(`[CMD] Executing: ${command} ${args.join(' ')}`);
-
-            const proc = spawn(command, args, {
-                cwd: vscode.workspace.workspaceFolders?.[0].uri.fsPath
-            });
-
-            let stderr = '';
-
-            proc.stdout.on('data', (data: Buffer) => {
-                outputChannel.appendLine(data.toString().trim());
-            });
-
-            proc.stderr.on('data', (data: Buffer) => {
-                stderr += data.toString();
-                outputChannel.appendLine(`[ERROR] ${data.toString().trim()}`);
-            });
-
-            proc.on('close', (code: number) => {
-                if (code === 0) {
-                    statusBar.text = `$(check) ${actionName} succeeded`;
-                    outputChannel.appendLine(`[CMD] ${actionName} completed successfully`);
-                    if (refreshAfter) {
+                    if (shmClient.hasPatchesChanged(events)) {
+                        outputChannel.appendLine('[EVENTS] Patches changed, refreshing tree');
                         treeProvider.refresh();
                     }
-                    setTimeout(() => statusBar.hide(), 3000);
-                    resolve();
-                } else {
-                    statusBar.text = `$(x) ${actionName} failed`;
-                    outputChannel.appendLine(`[CMD] ${actionName} failed with code ${code}`);
-                    if (stderr) {
-                        outputChannel.appendLine(`[CMD] Error: ${stderr}`);
+
+                    if (shmClient.hasBuildStarted(events)) {
+                        statusBar.text = '$(sync~spin) Building...';
+                        statusBar.show();
                     }
-                    setTimeout(() => statusBar.hide(), 5000);
-                    reject(new Error(`${actionName} failed with code ${code}`));
+
+                    if (shmClient.hasBuildCompleted(events)) {
+                        // Status bar will be updated by command completion
+                    }
                 }
-            });
-        });
+            } else {
+                // Health check: daemon not running, try to restart every 10 seconds
+                const now = Date.now();
+                if (now - lastHealthCheck > 10000) {
+                    lastHealthCheck = now;
+                    outputChannel.appendLine('[HEALTH] Daemon not running, attempting auto-restart...');
+                    ensureDaemonRunning();
+                }
+            }
+        } catch (error) {
+            // Silently ignore polling errors
+        }
+    }, 500); // Poll every 500ms
+
+    context.subscriptions.push({
+        dispose: () => clearInterval(eventPollInterval)
+    });
+
+    // Helper to execute daemon commands with status bar updates
+    const executeViaDaemon = async (
+        actionName: string,
+        daemonCall: () => Promise<any>,
+        refreshAfter: boolean = false
+    ) => {
+        // Ensure daemon is running before executing command
+        if (!shmClient.isDaemonRunning()) {
+            outputChannel.appendLine(`[CMD] Daemon not running, attempting to start...`);
+            const started = await ensureDaemonRunning();
+            if (!started) {
+                statusBar.text = `$(x) Daemon not running`;
+                outputChannel.appendLine(`[CMD] Failed to start daemon for ${actionName}`);
+                setTimeout(() => statusBar.hide(), 5000);
+                return;
+            }
+        }
+
+        statusBar.text = `$(sync~spin) ${actionName}...`;
+        statusBar.show();
+
+        try {
+            const response = await daemonCall();
+
+            if (response.status === 'Success') {
+                statusBar.text = `$(check) ${actionName} succeeded`;
+                outputChannel.appendLine(`[CMD] ${response.message}`);
+                if (refreshAfter) {
+                    treeProvider.refresh();
+                }
+                setTimeout(() => statusBar.hide(), 3000);
+            } else {
+                statusBar.text = `$(x) ${actionName} failed`;
+                outputChannel.appendLine(`[CMD] ${actionName} failed: ${response.message}`);
+                setTimeout(() => statusBar.hide(), 5000);
+            }
+        } catch (error) {
+            statusBar.text = `$(x) ${actionName} failed`;
+            outputChannel.appendLine(`[CMD] ${actionName} error: ${error}`);
+            setTimeout(() => statusBar.hide(), 5000);
+        }
     };
 
-    // Register build commands - all use silent execution with status bar
+    const cwd = () => vscode.workspace.workspaceFolders?.[0].uri.fsPath || '.';
+
+    // Register build commands - all use daemon
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.run', async () => {
             outputChannel.appendLine('[CMD] RUN command triggered');
-            await executeSilent('cargo', ['cairn', 'run'], statusBar, 'Run');
+            await executeViaDaemon('Run', () => shmClient.run(false, cwd()));
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.runRelease', async () => {
             outputChannel.appendLine('[CMD] RUN RELEASE command triggered');
-            await executeSilent('cargo', ['cairn', 'run', '--release'], statusBar, 'Run (Release)');
+            await executeViaDaemon('Run (Release)', () => shmClient.run(true, cwd()));
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.build', async () => {
             outputChannel.appendLine('[CMD] BUILD command triggered');
-            await executeSilent('cargo', ['cairn', 'build'], statusBar, 'Build', true);
+            await executeViaDaemon('Build', () => shmClient.build(false, cwd()), true);
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.buildRelease', async () => {
             outputChannel.appendLine('[CMD] BUILD RELEASE command triggered');
-            await executeSilent('cargo', ['cairn', 'build', '--release'], statusBar, 'Build (Release)', true);
+            await executeViaDaemon('Build (Release)', () => shmClient.build(true, cwd()), true);
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.check', async () => {
             outputChannel.appendLine('[CMD] CHECK command triggered');
-            await executeSilent('cargo', ['cairn', 'check'], statusBar, 'Check');
+            await executeViaDaemon('Check', () => shmClient.check(cwd()));
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.test', async () => {
             outputChannel.appendLine('[CMD] TEST command triggered');
-            await executeSilent('cargo', ['cairn', 'test'], statusBar, 'Test', true);
+            await executeViaDaemon('Test', () => shmClient.test(cwd()), true);
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.clear', async () => {
             outputChannel.appendLine('[CMD] CLEAR command triggered');
-
-            // Confirm with user first
-            const answer = await vscode.window.showWarningMessage(
-                'This will DELETE the .cairn directory and ALL patch history. This action cannot be undone.',
-                { modal: true },
-                'Delete'
-            );
-
-            if (answer !== 'Delete') {
-                outputChannel.appendLine('[CMD] Clear cancelled by user');
-                return;
-            }
-
-            // Execute with automatic "yes" response
-            const { spawn } = require('child_process');
-            statusBar.text = '$(sync~spin) Clearing cairn...';
-            statusBar.show();
-
-            const proc = spawn('sh', ['-c', 'echo y | cairn clear'], {
-                cwd: vscode.workspace.workspaceFolders?.[0].uri.fsPath
-            });
-
-            proc.stdout.on('data', (data: Buffer) => {
-                outputChannel.appendLine(data.toString().trim());
-            });
-
-            proc.stderr.on('data', (data: Buffer) => {
-                outputChannel.appendLine(`[ERROR] ${data.toString().trim()}`);
-            });
-
-            proc.on('close', (code: number) => {
-                if (code === 0) {
-                    statusBar.text = '$(check) Cleared cairn';
-                    outputChannel.appendLine('[CMD] Clear completed');
-                    treeProvider.refresh();
-                    setTimeout(() => statusBar.hide(), 3000);
-                } else {
-                    statusBar.text = '$(x) Clear failed';
-                    outputChannel.appendLine(`[CMD] Clear failed with code ${code}`);
-                    setTimeout(() => statusBar.hide(), 5000);
-                }
-            });
+            await executeViaDaemon('Clear', () => shmClient.clear(cwd()), true);
         })
     );
 
@@ -375,44 +448,31 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('cairn.jumpPatch', async (patchHash: string) => {
             outputChannel.appendLine(`[CMD] JUMP PATCH command triggered for: ${patchHash}`);
 
-            const { spawn } = require('child_process');
             const shortHash = patchHash.substring(0, 8);
+            const cwd = vscode.workspace.workspaceFolders?.[0].uri.fsPath || '.';
 
             // Update status bar - no blocking dialogs!
             statusBar.text = `$(sync~spin) Switching to ${shortHash}...`;
             statusBar.show();
 
-            const proc = spawn('cairn', ['jump', patchHash], {
-                cwd: vscode.workspace.workspaceFolders?.[0].uri.fsPath
-            });
+            try {
+                const response = await shmClient.jump(patchHash, cwd);
 
-            let stderr = '';
-
-            proc.stdout.on('data', (data: Buffer) => {
-                outputChannel.appendLine(`[JUMP] ${data.toString().trim()}`);
-            });
-
-            proc.stderr.on('data', (data: Buffer) => {
-                stderr += data.toString();
-                outputChannel.appendLine(`[JUMP ERROR] ${data.toString().trim()}`);
-            });
-
-            proc.on('close', (code: number) => {
-                if (code === 0) {
+                if (response.status === 'Success') {
                     statusBar.text = `$(check) Switched to ${shortHash}`;
-                    outputChannel.appendLine('[CMD] Jump completed successfully');
+                    outputChannel.appendLine(`[CMD] ${response.message}`);
                     treeProvider.refresh();
-                    // Auto-hide after 3 seconds
                     setTimeout(() => statusBar.hide(), 3000);
                 } else {
                     statusBar.text = `$(x) Failed to switch to ${shortHash}`;
-                    outputChannel.appendLine(`[CMD] Jump failed with code ${code}`);
-                    if (stderr) {
-                        outputChannel.appendLine(`[CMD] Error: ${stderr}`);
-                    }
+                    outputChannel.appendLine(`[CMD] Jump failed: ${response.message}`);
                     setTimeout(() => statusBar.hide(), 5000);
                 }
-            });
+            } catch (error) {
+                statusBar.text = `$(x) Failed to switch to ${shortHash}`;
+                outputChannel.appendLine(`[CMD] Jump error: ${error}`);
+                setTimeout(() => statusBar.hide(), 5000);
+            }
         })
     );
 

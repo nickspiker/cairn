@@ -8,14 +8,15 @@
 
 mod apply;
 mod blob;
-mod jump;
-mod patch_storage;
+mod daemon;
 mod decode;
 mod diff;
 mod encode;
 mod hash_encoding;
+mod jump;
 mod mnemonic;
 mod patch;
+mod patch_storage;
 mod reconstruct;
 mod snapshot;
 mod snapshot_vsf;
@@ -61,7 +62,10 @@ enum Commands {
     },
 
     /// Delete the .cairn directory and all patch history
-    Clean,
+    Clear,
+
+    /// Start the Cairn daemon for VSCode extension IPC
+    Daemon,
 
     /// Create a patch manually (for testing)
     #[command(hide = true)]
@@ -88,8 +92,11 @@ fn main() -> Result<()> {
         Commands::Jump { patch_id } => {
             cmd_jump(&patch_id)?;
         }
-        Commands::Clean => {
-            cmd_clean()?;
+        Commands::Clear => {
+            cmd_clear()?;
+        }
+        Commands::Daemon => {
+            daemon::start_daemon()?;
         }
         Commands::Snapshot { message } => {
             cmd_snapshot(&message)?;
@@ -253,12 +260,12 @@ fn cmd_jump(patch_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_clean() -> Result<()> {
+fn cmd_clear() -> Result<()> {
     let cairn_dir = PathBuf::from(".cairn");
 
     // Check if .cairn exists
     if !cairn_dir.exists() {
-        println!("No .cairn directory found - nothing to clean");
+        println!("No .cairn directory found - nothing to clear");
         return Ok(());
     }
 
@@ -283,7 +290,7 @@ fn cmd_clean() -> Result<()> {
     println!("Removing .cairn directory...");
     fs::remove_dir_all(&cairn_dir).context("Failed to remove .cairn directory")?;
 
-    println!("✓ Cleaned cairn repository");
+    println!("✓ Cleared cairn repository");
     Ok(())
 }
 
