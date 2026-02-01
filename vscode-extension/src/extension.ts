@@ -348,98 +348,102 @@ export function activate(context: vscode.ExtensionContext) {
         dispose: () => clearInterval(eventPollInterval)
     });
 
-    // Helper to execute daemon commands with status bar updates
-    const executeViaDaemon = async (
-        actionName: string,
-        daemonCall: () => Promise<any>,
-        refreshAfter: boolean = false
-    ) => {
-        // Ensure daemon is running before executing command
-        if (!shmClient.isDaemonRunning()) {
-            outputChannel.appendLine(`[CMD] Daemon not running, attempting to start...`);
-            const started = await ensureDaemonRunning();
-            if (!started) {
-                statusBar.text = `$(x) Daemon not running`;
-                outputChannel.appendLine(`[CMD] Failed to start daemon for ${actionName}`);
-                setTimeout(() => statusBar.hide(), 5000);
-                return;
-            }
-        }
-
-        statusBar.text = `$(sync~spin) ${actionName}...`;
-        statusBar.show();
-
-        try {
-            const response = await daemonCall();
-
-            if (response.status === 'Success') {
-                statusBar.text = `$(check) ${actionName} succeeded`;
-                outputChannel.appendLine(`[CMD] ${response.message}`);
-                if (refreshAfter) {
-                    treeProvider.refresh();
-                }
-                setTimeout(() => statusBar.hide(), 3000);
-            } else {
-                statusBar.text = `$(x) ${actionName} failed`;
-                outputChannel.appendLine(`[CMD] ${actionName} failed: ${response.message}`);
-                setTimeout(() => statusBar.hide(), 5000);
-            }
-        } catch (error) {
-            statusBar.text = `$(x) ${actionName} failed`;
-            outputChannel.appendLine(`[CMD] ${actionName} error: ${error}`);
-            setTimeout(() => statusBar.hide(), 5000);
-        }
-    };
-
     const cwd = () => vscode.workspace.workspaceFolders?.[0].uri.fsPath || '.';
 
-    // Register build commands - all use daemon
+    // Helper to execute commands in terminal
+    const executeInTerminal = (name: string, command: string) => {
+        outputChannel.appendLine(`[CMD] ${name} - running in terminal`);
+
+        // Reuse existing terminal or create new one
+        let terminal = vscode.window.terminals.find(t => t.name === 'Cairn');
+        if (!terminal) {
+            terminal = vscode.window.createTerminal({
+                name: 'Cairn',
+                cwd: cwd()
+            });
+        }
+
+        terminal.show(true); // Show but don't steal focus
+        terminal.sendText(command);
+
+        statusBar.text = `$(terminal) ${name}...`;
+        statusBar.show();
+        setTimeout(() => statusBar.hide(), 2000);
+    };
+
+    // Register cargo commands - use terminal for full output
     context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.run', async () => {
-            outputChannel.appendLine('[CMD] RUN command triggered');
-            await executeViaDaemon('Run', () => shmClient.run(false, cwd()));
+        vscode.commands.registerCommand('cairn.run', () => {
+            executeInTerminal('Run', 'cairn run');
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.runRelease', async () => {
-            outputChannel.appendLine('[CMD] RUN RELEASE command triggered');
-            await executeViaDaemon('Run (Release)', () => shmClient.run(true, cwd()));
+        vscode.commands.registerCommand('cairn.runRelease', () => {
+            executeInTerminal('Run (Release)', 'cairn run --release');
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.build', async () => {
-            outputChannel.appendLine('[CMD] BUILD command triggered');
-            await executeViaDaemon('Build', () => shmClient.build(false, cwd()), true);
+        vscode.commands.registerCommand('cairn.build', () => {
+            executeInTerminal('Build', 'cairn build');
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.buildRelease', async () => {
-            outputChannel.appendLine('[CMD] BUILD RELEASE command triggered');
-            await executeViaDaemon('Build (Release)', () => shmClient.build(true, cwd()), true);
+        vscode.commands.registerCommand('cairn.buildRelease', () => {
+            executeInTerminal('Build (Release)', 'cairn build --release');
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.check', async () => {
-            outputChannel.appendLine('[CMD] CHECK command triggered');
-            await executeViaDaemon('Check', () => shmClient.check(cwd()));
+        vscode.commands.registerCommand('cairn.check', () => {
+            executeInTerminal('Check', 'cairn check');
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.test', async () => {
-            outputChannel.appendLine('[CMD] TEST command triggered');
-            await executeViaDaemon('Test', () => shmClient.test(cwd()), true);
+        vscode.commands.registerCommand('cairn.test', () => {
+            executeInTerminal('Test', 'cairn test');
         })
     );
 
+    // Register cairn operations - use daemon for silent execution
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.clear', async () => {
             outputChannel.appendLine('[CMD] CLEAR command triggered');
-            await executeViaDaemon('Clear', () => shmClient.clear(cwd()), true);
+
+            // Ensure daemon is running
+            if (!shmClient.isDaemonRunning()) {
+                const started = await ensureDaemonRunning();
+                if (!started) {
+                    statusBar.text = `$(x) Daemon not running`;
+                    setTimeout(() => statusBar.hide(), 3000);
+                    return;
+                }
+            }
+
+            statusBar.text = `$(sync~spin) Clearing...`;
+            statusBar.show();
+
+            try {
+                const response = await shmClient.clear(cwd());
+
+                if (response.status === 'Success') {
+                    statusBar.text = `$(check) Cleared`;
+                    outputChannel.appendLine(`[CMD] ${response.message}`);
+                    treeProvider.refresh();
+                    setTimeout(() => statusBar.hide(), 2000);
+                } else {
+                    statusBar.text = `$(x) Clear failed`;
+                    outputChannel.appendLine(`[CMD] ${response.message}`);
+                    setTimeout(() => statusBar.hide(), 3000);
+                }
+            } catch (error) {
+                statusBar.text = `$(x) Clear failed`;
+                outputChannel.appendLine(`[CMD] Error: ${error}`);
+                setTimeout(() => statusBar.hide(), 3000);
+            }
         })
     );
 
