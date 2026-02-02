@@ -181,8 +181,6 @@ class CairnTreeProvider implements vscode.TreeDataProvider<CairnTreeItem> {
 }
 
 function findCairnBinary(): string {
-    const { execSync } = require('child_process');
-
     // Try multiple locations
     const candidates = [
         'cairn', // In PATH
@@ -307,8 +305,11 @@ export function activate(context: vscode.ExtensionContext) {
         outputChannel.appendLine('[INIT] File watcher registered for .cairn/patches');
     }
 
-    // Poll for daemon events and health check
+    // Poll for daemon events, health check, and patch changes
     let lastHealthCheck = Date.now();
+    let lastPatchCheck = Date.now();
+    let lastPatchCount = -1;
+
     const eventPollInterval = setInterval(() => {
         try {
             if (shmClient.isDaemonRunning()) {
@@ -319,6 +320,7 @@ export function activate(context: vscode.ExtensionContext) {
                     if (shmClient.hasPatchesChanged(events)) {
                         outputChannel.appendLine('[EVENTS] Patches changed, refreshing tree');
                         treeProvider.refresh();
+                        lastPatchCount = -1; // Reset count to force refresh on next poll
                     }
 
                     if (shmClient.hasBuildStarted(events)) {
@@ -337,6 +339,23 @@ export function activate(context: vscode.ExtensionContext) {
                     lastHealthCheck = now;
                     outputChannel.appendLine('[HEALTH] Daemon not running, attempting auto-restart...');
                     ensureDaemonRunning();
+                }
+            }
+
+            // Fallback: Poll patches directory every 2 seconds
+            // (VSCode file watcher doesn't always catch external changes)
+            const now = Date.now();
+            if (now - lastPatchCheck > 2000) {
+                lastPatchCheck = now;
+                const patchesDir = path.join(workspaceFolders?.[0]?.uri.fsPath || '.', '.cairn', 'patches');
+
+                if (fs.existsSync(patchesDir)) {
+                    const patches = fs.readdirSync(patchesDir).filter(f => f.endsWith('.vsf'));
+                    if (lastPatchCount !== -1 && patches.length !== lastPatchCount) {
+                        outputChannel.appendLine(`[POLL] Patch count changed: ${lastPatchCount} → ${patches.length}, refreshing tree`);
+                        treeProvider.refresh();
+                    }
+                    lastPatchCount = patches.length;
                 }
             }
         } catch (error) {
