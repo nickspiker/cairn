@@ -212,13 +212,12 @@ async function ensureDaemonRunning(): Promise<boolean> {
         const cairnBinary = findCairnBinary();
         outputChannel.appendLine(`[DAEMON] Using binary: ${cairnBinary}`);
 
-        // Start daemon in background
+        // Start daemon as child process (dies when extension dies)
         const { spawn } = require('child_process');
         const daemon = spawn(cairnBinary, ['daemon'], {
-            detached: true,
+            detached: false,
             stdio: 'ignore'
         });
-        daemon.unref(); // Allow parent to exit independently
 
         // Wait a bit for daemon to initialize
         await new Promise(resolve => setTimeout(resolve, 500));
