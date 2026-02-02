@@ -372,39 +372,40 @@ export function activate(context: vscode.ExtensionContext) {
     };
 
     // Register cargo commands - use terminal for full output
+    // Note: Using cargo directly until cargo-cairn wrapper is implemented
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.run', () => {
-            executeInTerminal('Run', 'cairn run');
+            executeInTerminal('Run', 'cargo run');
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.runRelease', () => {
-            executeInTerminal('Run (Release)', 'cairn run --release');
+            executeInTerminal('Run (Release)', 'cargo run --release');
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.build', () => {
-            executeInTerminal('Build', 'cairn build');
+            executeInTerminal('Build', 'cargo build');
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.buildRelease', () => {
-            executeInTerminal('Build (Release)', 'cairn build --release');
+            executeInTerminal('Build (Release)', 'cargo build --release');
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.check', () => {
-            executeInTerminal('Check', 'cairn check');
+            executeInTerminal('Check', 'cargo check');
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('cairn.test', () => {
-            executeInTerminal('Test', 'cairn test');
+            executeInTerminal('Test', 'cargo test');
         })
     );
 
