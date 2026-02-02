@@ -216,7 +216,15 @@ async function ensureDaemonRunning(): Promise<boolean> {
         const { spawn } = require('child_process');
         const daemon = spawn(cairnBinary, ['daemon'], {
             detached: false,
-            stdio: 'ignore'
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+
+        // Pipe daemon output to VSCode output channel
+        daemon.stdout.on('data', (data: Buffer) => {
+            outputChannel.append(data.toString());
+        });
+        daemon.stderr.on('data', (data: Buffer) => {
+            outputChannel.append(data.toString());
         });
 
         // Wait a bit for daemon to initialize
