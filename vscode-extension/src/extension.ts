@@ -88,29 +88,28 @@ class CairnTreeProvider implements vscode.TreeDataProvider<CairnTreeItem> {
 
     private getCurrentPatchHash(workspaceRoot: string): string | null {
         try {
-            // Read the actual current patch from state.vsf
-            const stateFile = path.join(workspaceRoot, '.cairn', 'state.vsf');
-            if (!fs.existsSync(stateFile)) {
+            // Call cairn current to get the current patch ID
+            const cairnBinary = findCairnBinary();
+            if (!cairnBinary) {
+                outputChannel.appendLine('[STATE] cairn binary not found');
                 return null;
             }
 
-            // Read state.vsf and extract current patch hash
-            const stateBytes = fs.readFileSync(stateFile);
-            const stateText = stateBytes.toString('utf8');
+            const result = require('child_process').spawnSync(cairnBinary, ['current'], {
+                cwd: workspaceRoot,
+                encoding: 'utf8'
+            });
 
-            // Simple text search for "current:" pattern
-            // Format: (current: <hash>,)
-            const currentMatch = stateText.match(/\(current:\s*([A-Za-z0-9]+),/);
-            if (currentMatch && currentMatch[1]) {
-                const currentHash = currentMatch[1];
-                outputChannel.appendLine(`[STATE] Current patch from state.vsf: ${currentHash.substring(0, 8)}`);
+            if (result.status === 0 && result.stdout) {
+                const currentHash = result.stdout.trim();
+                outputChannel.appendLine(`[STATE] Current patch: ${currentHash.substring(0, 8)}`);
                 return currentHash;
             }
 
-            outputChannel.appendLine(`[STATE] No current patch found in state.vsf`);
+            outputChannel.appendLine(`[STATE] No current patch (cairn current failed)`);
             return null;
         } catch (err) {
-            outputChannel.appendLine(`[STATE] Error reading state.vsf: ${err}`);
+            outputChannel.appendLine(`[STATE] Error getting current patch: ${err}`);
             return null;
         }
     }

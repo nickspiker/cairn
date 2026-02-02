@@ -31,7 +31,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "cairn")]
-#[command(about = "Patch-based version control for successful cargo builds")]
+#[command(about = "Patch-based version control for successful cargo builds with eggs")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -67,6 +67,10 @@ enum Commands {
     /// Start the Cairn daemon for VSCode extension IPC
     Daemon,
 
+    /// Print the current patch ID (for tooling)
+    #[command(hide = true)]
+    Current,
+
     /// Create a patch manually (for testing)
     #[command(hide = true)]
     Snapshot {
@@ -97,6 +101,9 @@ fn main() -> Result<()> {
         }
         Commands::Daemon => {
             daemon::start_daemon()?;
+        }
+        Commands::Current => {
+            cmd_current()?;
         }
         Commands::Snapshot { message } => {
             cmd_snapshot(&message)?;
@@ -291,6 +298,29 @@ fn cmd_clear() -> Result<()> {
     fs::remove_dir_all(&cairn_dir).context("Failed to remove .cairn directory")?;
 
     println!("✓ Cleared cairn repository");
+    Ok(())
+}
+
+fn cmd_current() -> Result<()> {
+    let cairn_dir = PathBuf::from(".cairn");
+
+    // Check if initialized
+    if !cairn_dir.exists() {
+        return Err(anyhow!(
+            "Not a cairn repository (no .cairn directory found)"
+        ));
+    }
+
+    // Load repository state
+    let repo_state =
+        state::RepositoryState::load(&cairn_dir).context("Failed to load repository state")?;
+
+    if repo_state.head.is_empty() {
+        return Err(anyhow!("No current patch - repository is empty"));
+    }
+
+    // Output just the patch ID (for tooling)
+    println!("{}", repo_state.head);
     Ok(())
 }
 
