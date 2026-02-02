@@ -34,8 +34,8 @@ fn main() -> anyhow::Result<()> {
         b"pub fn init() {\n    println!(\"git init\");\n}\n".to_vec(),
     );
     files.insert(
-        PathBuf::from("src/commands/git/commit.rs"),
-        b"pub fn commit() {\n    println!(\"git commit\");\n}\n".to_vec(),
+        PathBuf::from("src/commands/git/patch.rs"),
+        b"pub fn patch() {\n    println!(\"git patch\");\n}\n".to_vec(),
     );
     files.insert(
         PathBuf::from("src/utils/format.rs"),

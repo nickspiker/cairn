@@ -88,31 +88,29 @@ class CairnTreeProvider implements vscode.TreeDataProvider<CairnTreeItem> {
 
     private getCurrentPatchHash(workspaceRoot: string): string | null {
         try {
-            // Simple heuristic: newest patch by mtime is current
-            // This avoids blocking execSync calls that cause freezing
-            const patchesDir = path.join(workspaceRoot, '.cairn', 'patches');
-            if (!fs.existsSync(patchesDir)) {
+            // Read the actual current patch from state.vsf
+            const stateFile = path.join(workspaceRoot, '.cairn', 'state.vsf');
+            if (!fs.existsSync(stateFile)) {
                 return null;
             }
 
-            const patchFiles = fs.readdirSync(patchesDir, { withFileTypes: true })
-                .filter(dirent => dirent.isFile() && dirent.name.endsWith('.vsf'))
-                .map(dirent => {
-                    const filePath = path.join(patchesDir, dirent.name);
-                    const stats = fs.statSync(filePath);
-                    return { hash: dirent.name.replace('.vsf', ''), mtime: stats.mtime };
-                })
-                .sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+            // Read state.vsf and extract current patch hash
+            const stateBytes = fs.readFileSync(stateFile);
+            const stateText = stateBytes.toString('utf8');
 
-            if (patchFiles.length > 0) {
-                const currentHash = patchFiles[0].hash;
-                outputChannel.appendLine(`[STATE] Current patch (newest by mtime): ${currentHash.substring(0, 8)}`);
+            // Simple text search for "current:" pattern
+            // Format: (current: <hash>,)
+            const currentMatch = stateText.match(/\(current:\s*([A-Za-z0-9]+),/);
+            if (currentMatch && currentMatch[1]) {
+                const currentHash = currentMatch[1];
+                outputChannel.appendLine(`[STATE] Current patch from state.vsf: ${currentHash.substring(0, 8)}`);
                 return currentHash;
             }
 
+            outputChannel.appendLine(`[STATE] No current patch found in state.vsf`);
             return null;
         } catch (err) {
-            outputChannel.appendLine(`[STATE] Error getting current patch: ${err}`);
+            outputChannel.appendLine(`[STATE] Error reading state.vsf: ${err}`);
             return null;
         }
     }
@@ -277,95 +275,30 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
-    // Watch .cairn/patches directory for changes and auto-refresh
+    // Watch .cairn/.event signal file for immediate notification (no polling)
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (workspaceFolders) {
-        const cairnCommitsPattern = new vscode.RelativePattern(
+        const eventSignalPattern = new vscode.RelativePattern(
             workspaceFolders[0],
-            '.cairn/patches/**/*.vsf'
+            '.cairn/.event'
         );
-        const fileWatcher = vscode.workspace.createFileSystemWatcher(cairnCommitsPattern);
+        const eventWatcher = vscode.workspace.createFileSystemWatcher(eventSignalPattern);
 
-        fileWatcher.onDidCreate(() => {
-            outputChannel.appendLine('[WATCH] New patch created, refreshing tree');
+        eventWatcher.onDidCreate(() => {
+            outputChannel.appendLine('[EVENT] Signal file created, refreshing tree');
             treeProvider.refresh();
         });
 
-        fileWatcher.onDidDelete(() => {
-            outputChannel.appendLine('[WATCH] Patch deleted, refreshing tree');
+        eventWatcher.onDidChange(() => {
+            outputChannel.appendLine('[EVENT] Patches changed, refreshing tree');
             treeProvider.refresh();
         });
 
-        fileWatcher.onDidChange(() => {
-            outputChannel.appendLine('[WATCH] Patch modified, refreshing tree');
-            treeProvider.refresh();
-        });
-
-        context.subscriptions.push(fileWatcher);
-        outputChannel.appendLine('[INIT] File watcher registered for .cairn/patches');
+        context.subscriptions.push(eventWatcher);
+        outputChannel.appendLine('[INIT] Event watcher registered for .cairn/.event');
     }
 
-    // Poll for daemon events, health check, and patch changes
-    let lastHealthCheck = Date.now();
-    let lastPatchCheck = Date.now();
-    let lastPatchCount = -1;
-
-    const eventPollInterval = setInterval(() => {
-        try {
-            if (shmClient.isDaemonRunning()) {
-                const events = shmClient.pollEvents();
-                if (events !== 0) {
-                    outputChannel.appendLine(`[EVENTS] Received events: 0x${events.toString(16)}`);
-
-                    if (shmClient.hasPatchesChanged(events)) {
-                        outputChannel.appendLine('[EVENTS] Patches changed, refreshing tree');
-                        treeProvider.refresh();
-                        lastPatchCount = -1; // Reset count to force refresh on next poll
-                    }
-
-                    if (shmClient.hasBuildStarted(events)) {
-                        statusBar.text = '$(sync~spin) Building...';
-                        statusBar.show();
-                    }
-
-                    if (shmClient.hasBuildCompleted(events)) {
-                        // Status bar will be updated by command completion
-                    }
-                }
-            } else {
-                // Health check: daemon not running, try to restart every 10 seconds
-                const now = Date.now();
-                if (now - lastHealthCheck > 10000) {
-                    lastHealthCheck = now;
-                    outputChannel.appendLine('[HEALTH] Daemon not running, attempting auto-restart...');
-                    ensureDaemonRunning();
-                }
-            }
-
-            // Fallback: Poll patches directory every 2 seconds
-            // (VSCode file watcher doesn't always catch external changes)
-            const now = Date.now();
-            if (now - lastPatchCheck > 2000) {
-                lastPatchCheck = now;
-                const patchesDir = path.join(workspaceFolders?.[0]?.uri.fsPath || '.', '.cairn', 'patches');
-
-                if (fs.existsSync(patchesDir)) {
-                    const patches = fs.readdirSync(patchesDir).filter(f => f.endsWith('.vsf'));
-                    if (lastPatchCount !== -1 && patches.length !== lastPatchCount) {
-                        outputChannel.appendLine(`[POLL] Patch count changed: ${lastPatchCount} → ${patches.length}, refreshing tree`);
-                        treeProvider.refresh();
-                    }
-                    lastPatchCount = patches.length;
-                }
-            }
-        } catch (error) {
-            // Silently ignore polling errors
-        }
-    }, 500); // Poll every 500ms
-
-    context.subscriptions.push({
-        dispose: () => clearInterval(eventPollInterval)
-    });
+    // No polling needed - file watcher handles patch notifications
 
     const cwd = () => vscode.workspace.workspaceFolders?.[0].uri.fsPath || '.';
 
