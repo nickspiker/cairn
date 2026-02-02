@@ -13,12 +13,8 @@ use crate::tree;
 ///
 /// This reconstructs files from blobs referenced by the patch's tree.
 pub fn jump_to_patch(cairn_dir: &Path, patch_hash: &str) -> Result<()> {
-    println!("🔍 [JUMP] Starting jump to patch {}", &patch_hash[..8]);
-    println!("🔍 [JUMP] Using cairn_dir: {:?}", cairn_dir);
-
     // 1. Load current state
     let mut state = RepositoryState::load(&cairn_dir.to_path_buf())?;
-    println!("🔍 [JUMP] Current state loaded, head: {}", &state.head[..8]);
 
     // 2. Verify patch exists
     if !state.patches.iter().any(|p| p == patch_hash) {
@@ -42,7 +38,6 @@ pub fn jump_to_patch(cairn_dir: &Path, patch_hash: &str) -> Result<()> {
 
     // 6. Load each blob and reconstruct files
     let mut files = HashMap::new();
-    println!("🔍 [JUMP] Loading {} blobs...", file_to_blob.len());
     for (path, blob_hash) in &file_to_blob {
         let content = blob::load_blob(cairn_dir, blob_hash)
             .with_context(|| format!("Failed to load blob for {:?}", path))?;
@@ -50,9 +45,7 @@ pub fn jump_to_patch(cairn_dir: &Path, patch_hash: &str) -> Result<()> {
     }
 
     // 7. Write files to working directory
-    println!("🔍 [JUMP] Restoring {} files to working directory...", files.len());
     restore_files(&files)?;
-    println!("🔍 [JUMP] Files restored successfully");
 
     // 8. Update state to point to this patch
     state.head = patch_hash.to_string();
@@ -74,7 +67,6 @@ fn restore_files(files: &HashMap<PathBuf, Vec<u8>>) -> Result<()> {
         }
 
         // Write file
-        println!("  📝 Writing: {:?} ({} bytes)", path, content.len());
         fs::write(path, content)
             .with_context(|| format!("Failed to write file: {:?}", path))?;
     }
