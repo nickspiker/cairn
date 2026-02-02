@@ -18,7 +18,7 @@
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use vsf::types::EtType;
 use vsf::types::eagle_time;
 use vsf::verification::compute_provenance_hash;
@@ -80,12 +80,13 @@ pub fn create_tree(file_to_blob: &HashMap<PathBuf, Blake3Hash>) -> Result<Blake3
 /// Load a tree by its provenance hash
 ///
 /// # Arguments
+/// * `cairn_dir` - Path to .cairn directory
 /// * `hp` - Provenance hash (BLAKE3) of the tree to load
 ///
 /// # Returns
 /// * `HashMap<PathBuf, Blake3Hash>` - Mapping of file paths to blob hashes
-pub fn load_tree(hp: &Blake3Hash) -> Result<HashMap<PathBuf, Blake3Hash>> {
-    let tree_path = PathBuf::from(".cairn/trees")
+pub fn load_tree(cairn_dir: &Path, hp: &Blake3Hash) -> Result<HashMap<PathBuf, Blake3Hash>> {
+    let tree_path = cairn_dir.join("trees")
         .join(format!("{}.vsf", base58_encode(hp)));
 
     let bytes = fs::read(&tree_path)

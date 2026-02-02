@@ -209,7 +209,7 @@ pub fn start_daemon() -> Result<()> {
                 // Execute command
                 let response = match request.command.as_str() {
                     "ping" => DaemonResponse::success("pong"),
-                    "jump" => handle_jump(&request),
+                    "jump" => handle_jump(&request, &shm),
                     "build" => handle_build(&request, &shm),
                     "test" => handle_test(&request, &shm),
                     "check" => handle_check(&request),
@@ -300,7 +300,7 @@ fn encode_daemon_response(resp: &DaemonResponse) -> Result<Vec<u8>> {
 }
 
 /// Handle jump command
-fn handle_jump(req: &DaemonRequest) -> DaemonResponse {
+fn handle_jump(req: &DaemonRequest, shm: &DaemonSharedMem) -> DaemonResponse {
     if req.args.is_empty() {
         return DaemonResponse::error("Missing patch hash argument");
     }
@@ -312,6 +312,9 @@ fn handle_jump(req: &DaemonRequest) -> DaemonResponse {
 
     match crate::jump::jump_to_patch(&cairn_dir, patch_hash) {
         Ok(()) => {
+            // Notify extension that patches changed (current patch moved)
+            shm.set_event(EVENT_PATCHES_CHANGED);
+
             let short_hash = &patch_hash[..8.min(patch_hash.len())];
             DaemonResponse::success(format!("Switched to patch {}", short_hash))
         }

@@ -9,6 +9,8 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::{Command, exit};
+use std::sync::atomic::{AtomicU32, Ordering};
+use shared_memory::ShmemConf;
 
 fn main() {
     if let Err(e) = run() {
@@ -84,12 +86,15 @@ fn run() -> Result<()> {
 
     let exit_code = status.code().unwrap_or(1);
 
-    // If build succeeded and we took a snapshot, commit it
+    // If build succeeded and we took a snapshot, save it
     if status.success() && snapshot_taken {
-        if let Err(e) = commit_pending_snapshot() {
-            eprintln!("⚠️  Cairn: Failed to commit snapshot: {}", e);
+        if let Err(e) = save_pending_snapshot() {
+            eprintln!("⚠️  Cairn: Failed to create patch: {}", e);
         } else {
             println!("✓ Cairn: Patch created");
+
+            // Notify daemon via shared memory that patches changed
+            notify_daemon_patches_changed();
         }
     } else if snapshot_taken {
         // Build failed - discard the snapshot
@@ -132,7 +137,7 @@ fn create_pending_snapshot() -> Result<bool> {
 }
 
 /// Commit the pending snapshot as a real patch using Git-style architecture
-fn commit_pending_snapshot() -> Result<()> {
+fn save_pending_snapshot() -> Result<()> {
     let cairn_dir = PathBuf::from(".cairn");
     let pending_file = cairn_dir.join(".pending");
 
@@ -149,12 +154,12 @@ fn commit_pending_snapshot() -> Result<()> {
     let mut state = cairn::state::RepositoryState::load(&cairn_dir)
         .context("Failed to load repository state")?;
 
-    // Get parent commit hash (None for first commit)
-    let parent_commit_hp = if let Some(head) = state.latest() {
+    // Get parent patch hash (None for first patch)
+    let parent_patch_hp = if let Some(head) = state.latest() {
         // Decode base58 head to Blake3Hash
         let parent_bytes = bs58::decode(head)
             .into_vec()
-            .context("Failed to decode parent commit hash")?;
+            .context("Failed to decode parent patch hash")?;
         if parent_bytes.len() == 32 {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&parent_bytes);
@@ -175,11 +180,11 @@ fn commit_pending_snapshot() -> Result<()> {
         .context("Failed to create tree")?;
 
     // 3. Compute diffs from parent (if exists)
-    let file_diffs = if let Some(parent_hp) = parent_commit_hp {
-        // Load parent commit and tree
-        let parent_commit = cairn::patch_storage::load_commit(&parent_hp)
-            .context("Failed to load parent commit")?;
-        let parent_tree = cairn::tree::load_tree(&parent_commit.tree_hp)
+    let file_diffs = if let Some(parent_hp) = parent_patch_hp {
+        // Load parent patch and tree
+        let parent_patch = cairn::patch_storage::load_patch(&cairn_dir, &parent_hp)
+            .context("Failed to load parent patch")?;
+        let parent_tree = cairn::tree::load_tree(&cairn_dir, &parent_patch.tree_hp)
             .context("Failed to load parent tree")?;
 
         let mut diffs = std::collections::HashMap::new();
@@ -190,9 +195,9 @@ fn commit_pending_snapshot() -> Result<()> {
                 // File exists in parent - check if content changed
                 if old_blob_hash != new_blob_hash {
                     // File modified - compute byte-level diff
-                    let old_content = cairn::blob::load_blob(old_blob_hash)
+                    let old_content = cairn::blob::load_blob(&cairn_dir, old_blob_hash)
                         .context("Failed to load old blob")?;
-                    let new_content = cairn::blob::load_blob(new_blob_hash)
+                    let new_content = cairn::blob::load_blob(&cairn_dir, new_blob_hash)
                         .context("Failed to load new blob")?;
 
                     let diff_ops = cairn::diff::compute_byte_level_diff(&old_content, &new_content);
@@ -210,7 +215,7 @@ fn commit_pending_snapshot() -> Result<()> {
                 // If hashes same, no diff needed (file unchanged)
             } else {
                 // File added (not in parent) - store full content as Insert
-                let new_content = cairn::blob::load_blob(new_blob_hash)
+                let new_content = cairn::blob::load_blob(&cairn_dir, new_blob_hash)
                     .context("Failed to load new blob")?;
                 let file_diff = cairn::patch_storage::FileDiff {
                     strategy: cairn::patch_storage::DiffStrategy::Diff,
@@ -229,27 +234,27 @@ fn commit_pending_snapshot() -> Result<()> {
 
         Some(diffs)
     } else {
-        None // First commit - no parent, no diffs
+        None // First patch - no parent, no diffs
     };
 
-    // 4. Create commit with tree reference and diffs
+    // 4. Create patch with tree reference and diffs
     let build_hash = *blake3::hash(b"cargo-cairn build").as_bytes();
-    let commit_info = cairn::patch_storage::CommitInfo {
+    let patch_info = cairn::patch_storage::PatchInfo {
         message: "Successful build".to_string(),
         build_hash,
         tree_hp,
-        parent_commit_hp,
+        parent_patch_hp,
         file_diffs,
     };
 
-    let commit_hp = cairn::patch_storage::create_commit(commit_info)
-        .context("Failed to create commit")?;
+    let patch_hp = cairn::patch_storage::create_patch(patch_info)
+        .context("Failed to create patch")?;
 
     // 4. Update state with new commit (use base58 encoding for consistency)
-    let commit_hash_str = bs58::encode(&commit_hp).into_string();
+    let patch_hash_str = bs58::encode(&patch_hp).into_string();
 
     // For snapshot hash, use the tree's hp (directory structure snapshot)
-    state.add_patch(commit_hash_str, tree_hp);
+    state.add_patch(patch_hash_str, tree_hp);
     state.save(&cairn_dir).context("Failed to save state")?;
 
     // Remove pending file
@@ -268,6 +273,33 @@ fn discard_pending_snapshot() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Notify daemon that patches have changed via shared memory event flag
+fn notify_daemon_patches_changed() {
+    const EVENT_PATCHES_CHANGED: u32 = 0x01;
+
+    // Try to open shared memory and set event flag (non-fatal if daemon not running)
+    if let Ok(shmem) = ShmemConf::new()
+        .size(2060)
+        .os_id("cairn-daemon-shm")
+        .open()
+    {
+        unsafe {
+            // Shared memory layout: [lock: u64][events: u32][...buffers]
+            let events_ptr = shmem.as_ptr().add(8) as *const AtomicU32;
+            let events = &*events_ptr;
+            events.fetch_or(EVENT_PATCHES_CHANGED, Ordering::Release);
+        }
+    }
+
+    // Also write signal file for extension file watcher (event-driven, no polling)
+    let signal_file = PathBuf::from(".cairn/.event");
+    let _ = std::fs::write(&signal_file, &std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .to_le_bytes());
 }
 
 /// Auto-initialize cairn repository with flat directory structure

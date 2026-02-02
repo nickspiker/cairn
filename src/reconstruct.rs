@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::blob::{load_blob, store_blob};
-use crate::patch_storage::{load_commit, Commit};
+use crate::patch_storage::{load_patch, Patch};
 use crate::diff::compute_byte_level_diff;
 use crate::patch::ByteOp;
 use crate::state::Blake3Hash;
@@ -115,33 +115,35 @@ pub fn apply_diff_forward(base_content: &[u8], operations: &[ByteOp]) -> Result<
     Ok(output)
 }
 
-/// Reconstruct a file at a specific commit
+/// Reconstruct a file at a specific patch
 ///
-/// Walks back through commit chain, loading blobs and applying diffs
-/// until reaching the file's content at the target commit.
+/// Walks back through patch chain, loading blobs and applying diffs
+/// until reaching the file's content at the target patch.
 ///
 /// # Arguments
-/// * `commit_hp` - Provenance hash of target commit
+/// * `cairn_dir` - Path to .cairn directory
+/// * `patch_hp` - Provenance hash of target patch
 /// * `file_path` - Path of file to reconstruct
 ///
 /// # Returns
 /// * Reconstructed file content
 ///
 /// # Process
-/// 1. Load commit and get tree
+/// 1. Load patch and get tree
 /// 2. Get blob hash for file from tree
 /// 3. If file has parent diff, reconstruct from parent
 /// 4. Otherwise load blob directly
-pub fn reconstruct_file_at_commit(
-    commit_hp: &Blake3Hash,
+pub fn reconstruct_file_at_patch(
+    cairn_dir: &Path,
+    patch_hp: &Blake3Hash,
     file_path: &Path,
 ) -> Result<Vec<u8>> {
-    // Load the commit
-    let commit = load_commit(commit_hp)
-        .with_context(|| format!("Failed to load commit for reconstruction"))?;
+    // Load the patch
+    let patch = load_patch(cairn_dir, patch_hp)
+        .with_context(|| format!("Failed to load patch for reconstruction"))?;
 
     // Load the tree to get file→blob mapping
-    let tree = load_tree(&commit.tree_hp)
+    let tree = load_tree(cairn_dir, &patch.tree_hp)
         .with_context(|| format!("Failed to load tree for reconstruction"))?;
 
     // Get blob hash for this file
@@ -150,7 +152,7 @@ pub fn reconstruct_file_at_commit(
 
     // For now, just load the blob directly (no diff application yet)
     // TODO: Implement diff-based reconstruction when parent diffs are stored
-    let content = load_blob(blob_hash)
+    let content = load_blob(cairn_dir, blob_hash)
         .with_context(|| format!("Failed to load blob for file {:?}", file_path))?;
 
     Ok(content)
@@ -161,7 +163,7 @@ pub fn reconstruct_file_at_commit(
 /// Given operations that transform old → new,
 /// compute operations that transform new → old.
 ///
-/// Used for backward reconstruction through commit history.
+/// Used for backward reconstruction through patch history.
 pub fn reverse_diff_operations(
     old_content: &[u8],
     new_content: &[u8],

@@ -26,20 +26,20 @@ pub fn jump_to_patch(cairn_dir: &Path, patch_hash: &str) -> Result<()> {
     if patch_bytes.len() != 32 {
         anyhow::bail!("Invalid patch hash length: expected 32 bytes, got {}", patch_bytes.len());
     }
-    let mut commit_hp = [0u8; 32];
-    commit_hp.copy_from_slice(&patch_bytes);
+    let mut patch_hp = [0u8; 32];
+    patch_hp.copy_from_slice(&patch_bytes);
 
-    // 4. Load the commit to get the tree reference
-    let commit = crate::patch_storage::load_commit(&commit_hp)?;
+    // 4. Load the patch to get the tree reference
+    let patch = crate::patch_storage::load_patch(cairn_dir, &patch_hp)?;
 
     // 5. Load the tree to get path→blob mappings
-    let file_to_blob = tree::load_tree(&commit.tree_hp)
+    let file_to_blob = tree::load_tree(cairn_dir, &patch.tree_hp)
         .context("Failed to load tree")?;
 
     // 6. Load each blob and reconstruct files
     let mut files = HashMap::new();
     for (path, blob_hash) in &file_to_blob {
-        let content = blob::load_blob(blob_hash)
+        let content = blob::load_blob(cairn_dir, blob_hash)
             .with_context(|| format!("Failed to load blob for {:?}", path))?;
         files.insert(path.clone(), content);
     }

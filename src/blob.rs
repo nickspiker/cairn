@@ -43,12 +43,13 @@ pub fn store_blob(content: &[u8]) -> Result<Blake3Hash> {
 /// Load a blob by its content hash
 ///
 /// # Arguments
+/// * `cairn_dir` - Path to .cairn directory
 /// * `hb` - Content hash (BLAKE3) of the blob to load
 ///
 /// # Returns
 /// * `Vec<u8>` - Raw bytes of the blob content
-pub fn load_blob(hb: &Blake3Hash) -> Result<Vec<u8>> {
-    let blob_path = PathBuf::from(".cairn/blobs").join(base58_encode(hb));
+pub fn load_blob(cairn_dir: &Path, hb: &Blake3Hash) -> Result<Vec<u8>> {
+    let blob_path = cairn_dir.join("blobs").join(base58_encode(hb));
 
     fs::read(&blob_path)
         .with_context(|| format!("Failed to load blob {}", base58_encode(hb)))

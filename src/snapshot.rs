@@ -8,7 +8,7 @@
 
 use crate::blob;
 use crate::hash_encoding::base58_encode;
-use crate::patch_storage::{CommitInfo, create_commit};
+use crate::patch_storage::{PatchInfo, create_patch};
 use crate::state::RepositoryState;
 use crate::tree;
 use anyhow::{Context, Result};
@@ -50,7 +50,7 @@ pub fn create_snapshot_from_files(
         .context("Failed to create tree")?;
 
     // 3. Get parent commit hash (if exists)
-    let parent_commit_hp = if repo_state.is_empty() {
+    let parent_patch_hp = if repo_state.is_empty() {
         None
     } else {
         // Decode parent patch ID from base58 to get the raw hash
@@ -65,30 +65,30 @@ pub fn create_snapshot_from_files(
     };
 
     // 4. Check if there are any changes (compare tree hashes)
-    if let Some(parent_hp) = parent_commit_hp {
-        let parent_commit = crate::patch_storage::load_commit(&parent_hp)
-            .context("Failed to load parent commit")?;
+    if let Some(parent_hp) = parent_patch_hp {
+        let parent_patch = crate::patch_storage::load_patch(cairn_dir, &parent_hp)
+            .context("Failed to load parent patch")?;
 
-        if parent_commit.tree_hp == tree_hp {
+        if parent_patch.tree_hp == tree_hp {
             println!("No changes detected - skipping patch");
             return Ok(repo_state.head.clone());
         }
     }
 
-    // 5. Create commit with tree reference
-    let commit_info = CommitInfo {
+    // 5. Create patch with tree reference
+    let patch_info = PatchInfo {
         message,
         build_hash: *build_hash.as_bytes(),
         tree_hp,
-        parent_commit_hp,
+        parent_patch_hp,
         file_diffs: None,  // TODO: Compute diffs for space optimization
     };
 
-    let commit_hp = create_commit(commit_info)
-        .context("Failed to create commit")?;
+    let patch_hp = create_patch(patch_info)
+        .context("Failed to create patch")?;
 
-    // 6. Encode commit hash as base58 for the patch ID
-    let patch_id = base58_encode(&commit_hp);
+    // 6. Encode patch hash as base58 for the patch ID
+    let patch_id = base58_encode(&patch_hp);
 
     // 7. Update repository state with new patch and tree hash
     repo_state.add_patch(patch_id.clone(), tree_hp);

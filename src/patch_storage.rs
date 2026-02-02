@@ -1,16 +1,16 @@
-//! Commit storage - build metadata with tree references and parent chain
+//! Patch storage - build metadata with tree references and parent chain
 //!
-//! Commits are VSF files that record successful builds with:
+//! Patches are VSF files that record successful builds with:
 //! - Build metadata (timestamp, message, build hash)
 //! - Tree reference (root directory structure)
-//! - Optional parent reference (for commit chain)
+//! - Optional parent reference (for patch chain)
 //!
-//! Each commit is identified by its provenance hash (hp = BLAKE3(commit_vsf)),
+//! Each patch is identified by its provenance hash (hp = BLAKE3(patch_vsf)),
 //! which includes Eagle Time to ensure uniqueness.
 //!
-//! Commit VSF format:
+//! Patch VSF format:
 //! ```text
-//! [commit_metadata
+//! [patch_metadata
 //!   timestamp: eu6{oscillations}
 //!   build_hash: hb"..."
 //!   message: x"Successful build"
@@ -19,13 +19,13 @@
 //!   root: hp"tree_hash..."
 //! ]
 //! [parent (optional)
-//!   commit: hp"parent_commit_hash..."
+//!   patch: hp"parent_patch_hash..."
 //! ]
 //! ```
 
 use anyhow::{Context, Result, anyhow};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use vsf::types::EtType;
 use vsf::types::eagle_time;
 use vsf::verification::compute_provenance_hash;
@@ -36,17 +36,17 @@ use crate::patch::ByteOp;
 use crate::state::Blake3Hash;
 use std::collections::HashMap;
 
-/// Information needed to create a commit
+/// Information needed to create a patch
 #[derive(Debug, Clone)]
-pub struct CommitInfo {
-    /// Commit message (e.g., "Successful build")
+pub struct PatchInfo {
+    /// Patch message (e.g., "Successful build")
     pub message: String,
     /// Build output hash (BLAKE3 of cargo output)
     pub build_hash: Blake3Hash,
     /// Tree provenance hash (hp) - references directory structure
     pub tree_hp: Blake3Hash,
-    /// Parent commit provenance hash (hp) - None for first commit
-    pub parent_commit_hp: Option<Blake3Hash>,
+    /// Parent patch provenance hash (hp) - None for first patch
+    pub parent_patch_hp: Option<Blake3Hash>,
     /// Per-file diffs (only present when parent exists)
     pub file_diffs: Option<HashMap<PathBuf, FileDiff>>,
 }
@@ -70,7 +70,7 @@ impl DiffStrategy {
     }
 }
 
-/// Per-file diff information stored in commit
+/// Per-file diff information stored in patch
 #[derive(Debug, Clone)]
 pub struct FileDiff {
     /// Strategy: diff or new_blob (chain reset)
@@ -83,10 +83,10 @@ pub struct FileDiff {
     pub ops: Vec<ByteOp>,
 }
 
-/// Parsed commit data loaded from VSF
+/// Parsed patch data loaded from VSF
 #[derive(Debug, Clone)]
-pub struct Commit {
-    /// Commit message
+pub struct Patch {
+    /// Patch message
     pub message: String,
     /// Build output hash
     pub build_hash: Blake3Hash,
@@ -94,27 +94,27 @@ pub struct Commit {
     pub timestamp: u64,
     /// Tree provenance hash
     pub tree_hp: Blake3Hash,
-    /// Parent commit provenance hash (None for first commit)
-    pub parent_commit_hp: Option<Blake3Hash>,
+    /// Parent patch provenance hash (None for first patch)
+    pub parent_patch_hp: Option<Blake3Hash>,
     /// Per-file diffs (only present when parent exists)
     pub file_diffs: Option<HashMap<PathBuf, FileDiff>>,
 }
 
-/// Create a commit from metadata
+/// Create a patch from metadata
 ///
-/// Returns the commit's provenance hash (hp), which includes Eagle Time
+/// Returns the patch's provenance hash (hp), which includes Eagle Time
 /// for collision-free uniqueness.
 ///
 /// # Arguments
-/// * `info` - Commit metadata (message, build hash, tree, parent)
+/// * `info` - Patch metadata (message, build hash, tree, parent)
 ///
 /// # Returns
-/// * `Blake3Hash` - The commit's provenance hash (hp)
-pub fn create_commit(info: CommitInfo) -> Result<Blake3Hash> {
+/// * `Blake3Hash` - The patch's provenance hash (hp)
+pub fn create_patch(info: PatchInfo) -> Result<Blake3Hash> {
     let mut builder = VsfBuilder::new();
 
     // 1. Metadata section with Eagle Time
-    let mut metadata = VsfSection::new("commit_metadata");
+    let mut metadata = VsfSection::new("patch_metadata");
     let timestamp = eagle_time::eagle_time_oscillations();
     metadata.add_field("timestamp", VsfType::e(EtType::u(timestamp)));
     metadata.add_field("build_hash", VsfType::hb(info.build_hash.to_vec()));
@@ -127,9 +127,9 @@ pub fn create_commit(info: CommitInfo) -> Result<Blake3Hash> {
     builder = builder.add_section_direct(tree_section);
 
     // 3. Parent section (if exists)
-    if let Some(parent_hp) = info.parent_commit_hp {
+    if let Some(parent_hp) = info.parent_patch_hp {
         let mut parent_section = VsfSection::new("parent");
-        parent_section.add_field("commit", VsfType::hp(parent_hp.to_vec()));
+        parent_section.add_field("patch", VsfType::hp(parent_hp.to_vec()));
 
         // Add diffs section with VSF-encoded operations
         if let Some(ref diffs) = info.file_diffs {
@@ -174,46 +174,47 @@ pub fn create_commit(info: CommitInfo) -> Result<Blake3Hash> {
     }
 
     // 4. Build VSF bytes
-    let commit_bytes = builder.build().map_err(|e| anyhow!("{}", e))?;
+    let patch_bytes = builder.build().map_err(|e| anyhow!("{}", e))?;
 
     // 5. Compute provenance hash (includes Eagle Time → unique hp)
-    let hp = compute_provenance_hash(&commit_bytes).map_err(|e| anyhow!("{}", e))?;
+    let hp = compute_provenance_hash(&patch_bytes).map_err(|e| anyhow!("{}", e))?;
 
-    // 6. Write commit to .cairn/patches/{base58_hp}.vsf
-    let commits_dir = PathBuf::from(".cairn/patches");
-    fs::create_dir_all(&commits_dir).context("Failed to create commits directory")?;
+    // 6. Write patch to .cairn/patches/{base58_hp}.vsf
+    let patches_dir = PathBuf::from(".cairn/patches");
+    fs::create_dir_all(&patches_dir).context("Failed to create patches directory")?;
 
-    let commit_path = commits_dir.join(format!("{}.vsf", base58_encode(&hp)));
-    fs::write(&commit_path, &commit_bytes)
-        .with_context(|| format!("Failed to write commit {}", base58_encode(&hp)))?;
+    let patch_path = patches_dir.join(format!("{}.vsf", base58_encode(&hp)));
+    fs::write(&patch_path, &patch_bytes)
+        .with_context(|| format!("Failed to write patch {}", base58_encode(&hp)))?;
 
     Ok(hp)
 }
 
-/// Load a commit by its provenance hash
+/// Load a patch by its provenance hash
 ///
 /// # Arguments
-/// * `hp` - Provenance hash (BLAKE3) of the commit to load
+/// * `cairn_dir` - Path to .cairn directory
+/// * `hp` - Provenance hash (BLAKE3) of the patch to load
 ///
 /// # Returns
-/// * `Commit` - Parsed commit data
-pub fn load_commit(hp: &Blake3Hash) -> Result<Commit> {
-    let commit_path = PathBuf::from(".cairn/patches")
+/// * `Patch` - Parsed patch data
+pub fn load_patch(cairn_dir: &Path, hp: &Blake3Hash) -> Result<Patch> {
+    let patch_path = cairn_dir.join("patches")
         .join(format!("{}.vsf", base58_encode(hp)));
 
-    let bytes = fs::read(&commit_path)
-        .with_context(|| format!("Failed to load commit {}", base58_encode(hp)))?;
+    let bytes = fs::read(&patch_path)
+        .with_context(|| format!("Failed to load patch {}", base58_encode(hp)))?;
 
     // Parse VSF header
     let (header, _) = vsf::VsfHeader::decode(&bytes)
-        .map_err(|e| anyhow!("Failed to decode commit VSF header: {}", e))?;
+        .map_err(|e| anyhow!("Failed to decode patch VSF header: {}", e))?;
 
     // Parse sections
     let mut message = String::new();
     let mut build_hash = [0u8; 32];
     let mut timestamp = 0u64;
     let mut tree_hp = [0u8; 32];
-    let mut parent_commit_hp = None;
+    let mut parent_patch_hp = None;
     let mut file_diffs = None;
 
     for field in &header.fields {
@@ -226,7 +227,7 @@ pub fn load_commit(hp: &Blake3Hash) -> Result<Commit> {
             .map_err(|e| anyhow!("Failed to parse section '{}': {}", field.name, e))?;
 
         match section.name.as_str() {
-            "commit_metadata" => {
+            "patch_metadata" => {
                 // Extract message
                 if let Some(msg_field) = section.get_field("message") {
                     if let Some(VsfType::x(text)) = msg_field.values.first() {
@@ -266,13 +267,13 @@ pub fn load_commit(hp: &Blake3Hash) -> Result<Commit> {
                 }
             }
             "parent" => {
-                // Extract parent commit hp
-                if let Some(parent_field) = section.get_field("commit") {
+                // Extract parent patch hp
+                if let Some(parent_field) = section.get_field("patch") {
                     if let Some(VsfType::hp(hash_vec)) = parent_field.values.first() {
                         if hash_vec.len() == 32 {
                             let mut parent_hp = [0u8; 32];
                             parent_hp.copy_from_slice(hash_vec);
-                            parent_commit_hp = Some(parent_hp);
+                            parent_patch_hp = Some(parent_hp);
                         }
                     }
                 }
@@ -287,12 +288,12 @@ pub fn load_commit(hp: &Blake3Hash) -> Result<Commit> {
         }
     }
 
-    Ok(Commit {
+    Ok(Patch {
         message,
         build_hash,
         timestamp,
         tree_hp,
-        parent_commit_hp,
+        parent_patch_hp,
         file_diffs,
     })
 }
@@ -360,7 +361,7 @@ mod tests {
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn test_create_and_load_commit_no_parent() -> Result<()> {
+    fn test_create_and_load_patch_no_parent() -> Result<()> {
         let _lock = TEST_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
@@ -375,27 +376,27 @@ mod tests {
 
             // Create commit (no parent)
             let build_hash = *blake3::hash(b"cargo build output").as_bytes();
-            let commit_info = CommitInfo {
+            let commit_info = PatchInfo {
                 message: "Initial commit".to_string(),
                 build_hash,
                 tree_hp,
-                parent_commit_hp: None,
+                parent_patch_hp: None,
                 file_diffs: None,
             };
 
-            let commit_hp = create_commit(commit_info)?;
+            let commit_hp = create_patch(commit_info)?;
 
             // Verify commit exists
             assert!(commit_exists(&commit_hp));
 
             // Load commit
-            let loaded = load_commit(&commit_hp)?;
+            let loaded = load_patch(&commit_hp)?;
 
             // Verify fields
             assert_eq!(loaded.message, "Initial commit");
             assert_eq!(loaded.build_hash, build_hash);
             assert_eq!(loaded.tree_hp, tree_hp);
-            assert_eq!(loaded.parent_commit_hp, None);
+            assert_eq!(loaded.parent_patch_hp, None);
             assert!(loaded.timestamp > 0);
 
             Ok(())
@@ -406,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_and_load_commit_with_parent() -> Result<()> {
+    fn test_create_and_load_patch_with_parent() -> Result<()> {
         let _lock = TEST_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
@@ -419,14 +420,14 @@ mod tests {
             tree1_files.insert(PathBuf::from("file1.txt"), blob1);
             let tree1_hp = create_tree(&tree1_files)?;
 
-            let commit1_info = CommitInfo {
+            let commit1_info = PatchInfo {
                 message: "First commit".to_string(),
                 build_hash: *blake3::hash(b"build 1").as_bytes(),
                 tree_hp: tree1_hp,
-                parent_commit_hp: None,
+                parent_patch_hp: None,
                 file_diffs: None,
             };
-            let commit1_hp = create_commit(commit1_info)?;
+            let commit1_hp = create_patch(commit1_info)?;
 
             // Create second commit with parent
             let blob2 = store_blob(b"content 2")?;
@@ -434,22 +435,22 @@ mod tests {
             tree2_files.insert(PathBuf::from("file2.txt"), blob2);
             let tree2_hp = create_tree(&tree2_files)?;
 
-            let commit2_info = CommitInfo {
+            let commit2_info = PatchInfo {
                 message: "Second commit".to_string(),
                 build_hash: *blake3::hash(b"build 2").as_bytes(),
                 tree_hp: tree2_hp,
-                parent_commit_hp: Some(commit1_hp),
+                parent_patch_hp: Some(commit1_hp),
                 file_diffs: None,
             };
-            let commit2_hp = create_commit(commit2_info)?;
+            let commit2_hp = create_patch(commit2_info)?;
 
             // Load second commit
-            let loaded = load_commit(&commit2_hp)?;
+            let loaded = load_patch(&commit2_hp)?;
 
             // Verify parent reference
             assert_eq!(loaded.message, "Second commit");
             assert_eq!(loaded.tree_hp, tree2_hp);
-            assert_eq!(loaded.parent_commit_hp, Some(commit1_hp));
+            assert_eq!(loaded.parent_patch_hp, Some(commit1_hp));
 
             Ok(())
         })();
@@ -474,37 +475,37 @@ mod tests {
 
             // Create first commit
             let build_hash = *blake3::hash(b"build").as_bytes();
-            let commit1_info = CommitInfo {
+            let commit1_info = PatchInfo {
                 message: "Test commit".to_string(),
                 build_hash,
                 tree_hp,
-                parent_commit_hp: None,
+                parent_patch_hp: None,
                 file_diffs: None,
             };
-            let commit1_hp = create_commit(commit1_info)?;
+            let commit1_hp = create_patch(commit1_info)?;
 
             // Wait a tiny bit
             std::thread::sleep(std::time::Duration::from_micros(1));
 
             // Create second commit with identical content
-            let commit2_info = CommitInfo {
+            let commit2_info = PatchInfo {
                 message: "Test commit".to_string(),
                 build_hash,
                 tree_hp,
-                parent_commit_hp: None,
+                parent_patch_hp: None,
                 file_diffs: None,
             };
-            let commit2_hp = create_commit(commit2_info)?;
+            let commit2_hp = create_patch(commit2_info)?;
 
-            // Commits should have different hp due to Eagle Time
+            // Patchs should have different hp due to Eagle Time
             assert_ne!(
                 commit1_hp, commit2_hp,
-                "Commits with identical content should have different hp due to Eagle Time"
+                "Patchs with identical content should have different hp due to Eagle Time"
             );
 
             // But both should reference the same tree
-            let loaded1 = load_commit(&commit1_hp)?;
-            let loaded2 = load_commit(&commit2_hp)?;
+            let loaded1 = load_patch(&commit1_hp)?;
+            let loaded2 = load_patch(&commit2_hp)?;
             assert_eq!(loaded1.tree_hp, loaded2.tree_hp);
 
             Ok(())
@@ -532,28 +533,28 @@ mod tests {
                 tree_files.insert(PathBuf::from(format!("file{}.txt", i)), blob);
                 let tree_hp = create_tree(&tree_files)?;
 
-                let commit_info = CommitInfo {
-                    message: format!("Commit {}", i),
+                let commit_info = PatchInfo {
+                    message: format!("Patch {}", i),
                     build_hash: *blake3::hash(format!("build {}", i).as_bytes()).as_bytes(),
                     tree_hp,
-                    parent_commit_hp: parent_hp,
+                    parent_patch_hp: parent_hp,
                     file_diffs: None,
                 };
 
-                let commit_hp = create_commit(commit_info)?;
+                let commit_hp = create_patch(commit_info)?;
                 commits.push(commit_hp);
                 parent_hp = Some(commit_hp);
             }
 
             // Verify chain: commit 2 → commit 1 → commit 0
-            let commit2 = load_commit(&commits[2])?;
-            assert_eq!(commit2.parent_commit_hp, Some(commits[1]));
+            let commit2 = load_patch(&commits[2])?;
+            assert_eq!(commit2.parent_patch_hp, Some(commits[1]));
 
-            let commit1 = load_commit(&commits[1])?;
-            assert_eq!(commit1.parent_commit_hp, Some(commits[0]));
+            let commit1 = load_patch(&commits[1])?;
+            assert_eq!(commit1.parent_patch_hp, Some(commits[0]));
 
-            let commit0 = load_commit(&commits[0])?;
-            assert_eq!(commit0.parent_commit_hp, None);
+            let commit0 = load_patch(&commits[0])?;
+            assert_eq!(commit0.parent_patch_hp, None);
 
             Ok(())
         })();
