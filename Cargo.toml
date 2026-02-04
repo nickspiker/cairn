@@ -1,6 +1,6 @@
 [package]
 name = "cairn"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 authors = ["Nick Spiker"]
 description = "Build-gated version control for Rust projects - EXPERIMENTAL, NOT PRODUCTION READY"
@@ -31,7 +31,7 @@ name = "cargo-cairn"
 path = "src/bin/cargo-cairn.rs"
 
 [dependencies]
-vsf = { version = "0.2.3", features = ["text", "crypto"] }
+vsf = { path = "../vsf", features = ["text", "crypto"] }
 blake3 = "1.5"
 chrono = "0.4"
 anyhow = "1.0"

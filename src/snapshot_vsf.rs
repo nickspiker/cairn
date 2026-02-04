@@ -2,9 +2,6 @@
 //!
 //! Each snapshot is a VSF file containing the entire workspace using direct labels:
 //! ```text
-//! [snapshot_metadata]
-//!   created: eu6{oscillations}
-//!
 //! [files]
 //!   (Cargo.toml: x{text})
 //!   (src/main.rs: x{text})
@@ -13,7 +10,7 @@
 //! ```
 //!
 //! Benefits:
-//! - Single provenance hash verifies entire snapshot
+//! - Single provenance hash verifies entire snapshot (content-based for duplicate detection)
 //! - Compact direct labels for file paths (no nested sections)
 //! - Automatic compression for text files (Huffman)
 //! - Self-contained atomic snapshots
@@ -22,45 +19,49 @@ use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use vsf::types::EtType;
-use vsf::types::eagle_time;
-use vsf::verification::compute_provenance_hash;
 use vsf::{VsfBuilder, VsfSection, VsfType};
 
 use crate::hash_encoding::base58_encode;
 
 /// Create a snapshot VSF file from a HashMap of files
 ///
-/// Returns the provenance hash of the snapshot (used to identify it)
+/// Returns the provenance hash of the snapshot (content-based for duplicate detection)
 pub fn create_snapshot(files: &HashMap<PathBuf, Vec<u8>>, cairn_dir: &Path) -> Result<[u8; 32]> {
+    // 1. Compute content hash from sorted file contents
+    let mut hasher = blake3::Hasher::new();
+
+    // Sort entries by path for deterministic hashing
+    let mut sorted_entries: Vec<_> = files.iter().collect();
+    sorted_entries.sort_by_key(|(path, _)| path.as_os_str());
+
+    // Hash the sorted path→content mappings
+    for (path, content) in &sorted_entries {
+        hasher.update(path.as_os_str().as_encoded_bytes());
+        hasher.update(content);
+    }
+
+    let content_hash = *hasher.finalize().as_bytes();
+
+    // 2. Check if snapshot with this content already exists
+    let snapshots_dir = cairn_dir.join("snapshots");
+    let snapshot_path = snapshots_dir.join(format!("{}.vsf", base58_encode(&content_hash)));
+
+    if snapshot_path.exists() {
+        // Duplicate snapshot - return existing hash without writing
+        return Ok(content_hash);
+    }
+
+    // 3. Build VSF for new snapshot
     let mut builder = VsfBuilder::new();
-
-    // Add metadata section
-    let mut metadata = VsfSection::new("snapshot_metadata");
-    metadata.add_field(
-        "created",
-        VsfType::e(EtType::u(eagle_time::eagle_time_oscillations())),
-    );
-    builder = builder.add_section_direct(metadata);
-
-    // Build nested directory structure
     let files_section = build_file_tree(files)?;
     builder = builder.add_section_direct(files_section);
 
-    // Build VSF bytes
+    // 4. Build and write VSF
     let vsf_bytes = builder.build().map_err(|e| anyhow!("{}", e))?;
-
-    // Compute provenance hash (identifies this snapshot)
-    let provenance = compute_provenance_hash(&vsf_bytes).map_err(|e| anyhow!("{}", e))?;
-
-    // Write snapshot to file
-    let snapshots_dir = cairn_dir.join("snapshots");
     fs::create_dir_all(&snapshots_dir).context("Failed to create snapshots directory")?;
-
-    let snapshot_path = snapshots_dir.join(format!("{}.vsf", base58_encode(&provenance)));
     fs::write(&snapshot_path, &vsf_bytes).context("Failed to write snapshot VSF")?;
 
-    Ok(provenance)
+    Ok(content_hash)
 }
 
 /// Build a VSF section with direct labels for each file
@@ -70,8 +71,12 @@ pub fn create_snapshot(files: &HashMap<PathBuf, Vec<u8>>, cairn_dir: &Path) -> R
 fn build_file_tree(files: &HashMap<PathBuf, Vec<u8>>) -> Result<VsfSection> {
     let mut root = VsfSection::new("files");
 
+    // Sort entries by path for deterministic hash computation
+    let mut sorted_entries: Vec<_> = files.iter().collect();
+    sorted_entries.sort_by_key(|(path, _)| path.as_os_str());
+
     // Add each file as a direct label with its content
-    for (path, content) in files {
+    for (path, content) in sorted_entries {
         // Convert path to VSF-compatible label: replace / with . and escape special chars
         let path_str = path_to_vsf_label(path)?;
 

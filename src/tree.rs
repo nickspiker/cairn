@@ -2,13 +2,10 @@
 //!
 //! Trees are VSF files that map file paths to blob hashes (hb).
 //! Each tree is identified by its provenance hash (hp = BLAKE3(tree_vsf)),
-//! which includes Eagle Time to ensure uniqueness even for identical content.
+//! which is computed from the file→blob mappings.
 //!
 //! Tree VSF format:
 //! ```text
-//! [tree_metadata
-//!   created: eu6{oscillations}
-//! ]
 //! [files
 //!   (f_7372632f6c69622e7273: hb"abc123...")  # src/lib.rs → blob hash
 //!   (f_7372632f6d61696e2e7273: hb"def456...")  # src/main.rs → blob hash
@@ -19,9 +16,6 @@ use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use vsf::types::EtType;
-use vsf::types::eagle_time;
-use vsf::verification::compute_provenance_hash;
 use vsf::{VsfBuilder, VsfSection, VsfType};
 
 use crate::hash_encoding::base58_encode;
@@ -30,8 +24,8 @@ use crate::state::Blake3Hash;
 
 /// Create a tree from file→blob mappings
 ///
-/// Returns the tree's provenance hash (hp), which includes Eagle Time
-/// for collision-free uniqueness.
+/// Returns the tree's provenance hash (hp), which is computed from the
+/// file→blob mappings. Identical content produces identical hashes.
 ///
 /// # Arguments
 /// * `file_to_blob` - Mapping of file paths to their blob content hashes (hb)
@@ -39,42 +33,55 @@ use crate::state::Blake3Hash;
 /// # Returns
 /// * `Blake3Hash` - The tree's provenance hash (hp)
 pub fn create_tree(file_to_blob: &HashMap<PathBuf, Blake3Hash>) -> Result<Blake3Hash> {
+    // 1. Compute content hash from sorted blob hashes ONLY (no paths)
+    // This gives us pure content-based deduplication
+    let mut hasher = blake3::Hasher::new();
+
+    // Sort blob hashes only (file paths not included in hash)
+    let mut sorted_hashes: Vec<_> = file_to_blob.values().copied().collect();
+    sorted_hashes.sort();
+
+    // Hash the sorted blob hashes
+    for blob_hash in &sorted_hashes {
+        hasher.update(blob_hash);
+    }
+
+    let content_hash = *hasher.finalize().as_bytes();
+
+    // Keep sorted entries for VSF storage (paths needed for reconstruction)
+    let mut sorted_entries: Vec<_> = file_to_blob.iter().collect();
+    sorted_entries.sort_by_key(|(path, _)| path.as_os_str());
+
+    // 2. Check if tree with this content already exists
+    let trees_dir = PathBuf::from(".cairn/trees");
+    let tree_path = trees_dir.join(format!("{}.vsf", base58_encode(&content_hash)));
+
+    if tree_path.exists() {
+        // Duplicate tree - return existing hash without writing
+        println!("  Tree already exists (content-based deduplication)");
+        return Ok(content_hash);
+    }
+
+    // 3. Build VSF for new tree
     let mut builder = VsfBuilder::new();
-
-    // 1. Metadata section with Eagle Time
-    let mut metadata = VsfSection::new("tree_metadata");
-    metadata.add_field(
-        "created",
-        VsfType::e(EtType::u(eagle_time::eagle_time_oscillations())),
-    );
-    builder = builder.add_section_direct(metadata);
-
-    // 2. Files section with path→blob mappings
     let mut files = VsfSection::new("files");
-    for (path, blob_hash) in file_to_blob {
+
+    for (path, blob_hash) in sorted_entries {
         // Convert path to hex-encoded VSF label
         let label = path_to_vsf_label(path)?;
-
         // Store blob hash as hb type
         files.add_field(&label, VsfType::hb(blob_hash.to_vec()));
     }
     builder = builder.add_section_direct(files);
 
-    // 3. Build VSF bytes
+    // 4. Build and write VSF
     let tree_bytes = builder.build().map_err(|e| anyhow!("{}", e))?;
-
-    // 4. Compute provenance hash (includes Eagle Time → unique hp)
-    let hp = compute_provenance_hash(&tree_bytes).map_err(|e| anyhow!("{}", e))?;
-
-    // 5. Write tree to .cairn/trees/{base58_hp}.vsf
-    let trees_dir = PathBuf::from(".cairn/trees");
     fs::create_dir_all(&trees_dir).context("Failed to create trees directory")?;
-
-    let tree_path = trees_dir.join(format!("{}.vsf", base58_encode(&hp)));
     fs::write(&tree_path, &tree_bytes)
-        .with_context(|| format!("Failed to write tree {}", base58_encode(&hp)))?;
+        .with_context(|| format!("Failed to write tree {}", base58_encode(&content_hash)))?;
 
-    Ok(hp)
+    println!("  Stored tree: {}", base58_encode(&content_hash));
+    Ok(content_hash)
 }
 
 /// Load a tree by its provenance hash
@@ -191,7 +198,8 @@ mod tests {
             assert!(tree_exists(&tree_hp));
 
             // Load tree
-            let loaded = load_tree(&tree_hp)?;
+            let cairn_dir = PathBuf::from(".cairn");
+            let loaded = load_tree(&cairn_dir, &tree_hp)?;
 
             // Verify mappings
             assert_eq!(loaded.len(), 2);
@@ -206,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tree_provenance_hash_includes_eagle_time() -> Result<()> {
+    fn test_tree_content_based_hashing() -> Result<()> {
         let _lock = TEST_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
@@ -224,25 +232,25 @@ mod tests {
             // Create first tree
             let tree1_hp = create_tree(&file_to_blob)?;
 
-            // Wait a tiny bit (Eagle Time has 704ps resolution, but filesystem ops take longer)
-            std::thread::sleep(std::time::Duration::from_micros(1));
-
             // Create second tree with identical content
             let tree2_hp = create_tree(&file_to_blob)?;
 
-            // Trees should have different hp due to Eagle Time
-            assert_ne!(
+            // Trees should have identical hp since content is identical (duplicate detection)
+            assert_eq!(
                 tree1_hp, tree2_hp,
-                "Trees with identical content should have different hp due to Eagle Time"
+                "Trees with identical content should have identical hp for duplicate detection"
             );
 
-            // But both should reference the same blob
-            let loaded1 = load_tree(&tree1_hp)?;
-            let loaded2 = load_tree(&tree2_hp)?;
+            // Load the tree (both hashes point to the same tree)
+            let cairn_dir = PathBuf::from(".cairn");
+            let loaded = load_tree(&cairn_dir, &tree1_hp)?;
             assert_eq!(
-                loaded1.get(&PathBuf::from("test.txt")),
-                loaded2.get(&PathBuf::from("test.txt"))
+                loaded.get(&PathBuf::from("test.txt")),
+                Some(&blob_hash)
             );
+
+            // Only one tree file should exist (since they have the same hash)
+            assert!(tree_exists(&tree1_hp));
 
             Ok(())
         })();
@@ -264,7 +272,8 @@ mod tests {
             let tree_hp = create_tree(&file_to_blob)?;
 
             // Load empty tree
-            let loaded = load_tree(&tree_hp)?;
+            let cairn_dir = PathBuf::from(".cairn");
+            let loaded = load_tree(&cairn_dir, &tree_hp)?;
 
             assert_eq!(loaded.len(), 0);
             Ok(())
@@ -295,7 +304,8 @@ mod tests {
 
             // Create and load tree
             let tree_hp = create_tree(&file_to_blob)?;
-            let loaded = load_tree(&tree_hp)?;
+            let cairn_dir = PathBuf::from(".cairn");
+            let loaded = load_tree(&cairn_dir, &tree_hp)?;
 
             // Verify all paths preserved correctly
             assert_eq!(loaded.len(), 3);

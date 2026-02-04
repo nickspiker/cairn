@@ -239,7 +239,7 @@ checksum = "5dd9dc738b7a8311c7ade152424974d8115f2cdad61e8dab8dac9f2362298510"
 
 [[package]]
 name = "cairn"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1508,8 +1508,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vsf"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca562829f4d1ba38932c521e52da6176715675912f6c33bdbda00179baea939c"
 dependencies = [
  "aes-gcm",
  "bitvec",

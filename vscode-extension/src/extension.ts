@@ -1,10 +1,10 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { DaemonShmClient } from './shmClient';
+import { DaemonPipeClient } from './pipeClient';
 
 let outputChannel: vscode.OutputChannel;
-let shmClient: DaemonShmClient;
+let pipeClient: DaemonPipeClient;
 
 class CairnTreeItem extends vscode.TreeItem {
     constructor(
@@ -200,64 +200,18 @@ function findCairnBinary(): string {
     return 'cairn';
 }
 
-async function ensureDaemonRunning(): Promise<boolean> {
-    if (shmClient.isDaemonRunning()) {
-        outputChannel.appendLine('[DAEMON] Already running');
-        return true;
-    }
-
-    outputChannel.appendLine('[DAEMON] Not running, starting daemon...');
-
-    try {
-        const cairnBinary = findCairnBinary();
-        outputChannel.appendLine(`[DAEMON] Using binary: ${cairnBinary}`);
-
-        // Start daemon as child process (dies when extension dies)
-        const { spawn } = require('child_process');
-        const daemon = spawn(cairnBinary, ['daemon'], {
-            detached: false,
-            stdio: ['ignore', 'pipe', 'pipe']
-        });
-
-        // Pipe daemon output to VSCode output channel
-        daemon.stdout.on('data', (data: Buffer) => {
-            outputChannel.append(data.toString());
-        });
-        daemon.stderr.on('data', (data: Buffer) => {
-            outputChannel.append(data.toString());
-        });
-
-        // Wait a bit for daemon to initialize
-        await new Promise(resolve => setTimeout(resolve, 500));
-
-        if (shmClient.isDaemonRunning()) {
-            outputChannel.appendLine('[DAEMON] Started successfully');
-            return true;
-        } else {
-            outputChannel.appendLine('[DAEMON] Failed to start - shared memory not found');
-            return false;
-        }
-    } catch (error) {
-        outputChannel.appendLine(`[DAEMON] Failed to start: ${error}`);
-        return false;
-    }
-}
+// Daemon is auto-started by pipeClient when needed
 
 export function activate(context: vscode.ExtensionContext) {
     outputChannel = vscode.window.createOutputChannel('Cairn');
     outputChannel.appendLine('=== Cairn extension activated ===');
     outputChannel.show();
 
-    // Initialize shared memory client
-    shmClient = new DaemonShmClient();
-    outputChannel.appendLine('[INIT] Shared memory client initialized');
-
-    // Auto-start daemon if not running
-    ensureDaemonRunning().then(running => {
-        if (!running) {
-            outputChannel.appendLine('[DAEMON] Warning: Failed to auto-start daemon');
-        }
-    });
+    // Initialize pipe client
+    const daemonPath = findCairnBinary();
+    pipeClient = new DaemonPipeClient(daemonPath);
+    outputChannel.appendLine('[INIT] Pipe client initialized');
+    outputChannel.appendLine(`[DAEMON] Using binary: ${daemonPath}`);
 
     // Create tree view in sidebar
     const treeProvider = new CairnTreeProvider();
@@ -281,30 +235,8 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
-    // Watch .cairn/.event signal file for immediate notification (no polling)
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (workspaceFolders) {
-        const eventSignalPattern = new vscode.RelativePattern(
-            workspaceFolders[0],
-            '.cairn/.event'
-        );
-        const eventWatcher = vscode.workspace.createFileSystemWatcher(eventSignalPattern);
-
-        eventWatcher.onDidCreate(() => {
-            outputChannel.appendLine('[EVENT] Signal file created, refreshing tree');
-            treeProvider.refresh();
-        });
-
-        eventWatcher.onDidChange(() => {
-            outputChannel.appendLine('[EVENT] Patches changed, refreshing tree');
-            treeProvider.refresh();
-        });
-
-        context.subscriptions.push(eventWatcher);
-        outputChannel.appendLine('[INIT] Event watcher registered for .cairn/.event');
-    }
-
-    // No polling needed - file watcher handles patch notifications
+    // No polling needed with pipes - daemon will be spawned on-demand
+    outputChannel.appendLine('[INIT] Pipe IPC ready (event-driven)');
 
     const cwd = () => vscode.workspace.workspaceFolders?.[0].uri.fsPath || '.';
 
@@ -343,14 +275,70 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.build', () => {
-            executeInTerminal('Build', 'cargo cairn build');
+        vscode.commands.registerCommand('cairn.build', async () => {
+            outputChannel.appendLine('[CMD] BUILD command triggered');
+
+            statusBar.text = `$(sync~spin) Building...`;
+            statusBar.show();
+
+            try {
+                const response = await pipeClient.build([], cwd());
+
+                if (response.status === 'Success') {
+                    statusBar.text = `$(check) Build complete`;
+                    outputChannel.appendLine(`[CMD] ${response.message}`);
+                    if (response.data) {
+                        outputChannel.appendLine(response.data);
+                    }
+                    treeProvider.refresh();
+                    setTimeout(() => statusBar.hide(), 3000);
+                } else {
+                    statusBar.text = `$(x) Build failed`;
+                    outputChannel.appendLine(`[CMD] ${response.message}`);
+                    if (response.data) {
+                        outputChannel.appendLine(response.data);
+                    }
+                    setTimeout(() => statusBar.hide(), 5000);
+                }
+            } catch (error) {
+                statusBar.text = `$(x) Build failed`;
+                outputChannel.appendLine(`[CMD] Error: ${error}`);
+                setTimeout(() => statusBar.hide(), 3000);
+            }
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('cairn.buildRelease', () => {
-            executeInTerminal('Build (Release)', 'cargo cairn build --release');
+        vscode.commands.registerCommand('cairn.buildRelease', async () => {
+            outputChannel.appendLine('[CMD] BUILD RELEASE command triggered');
+
+            statusBar.text = `$(sync~spin) Building (release)...`;
+            statusBar.show();
+
+            try {
+                const response = await pipeClient.build(['--release'], cwd());
+
+                if (response.status === 'Success') {
+                    statusBar.text = `$(check) Build complete (release)`;
+                    outputChannel.appendLine(`[CMD] ${response.message}`);
+                    if (response.data) {
+                        outputChannel.appendLine(response.data);
+                    }
+                    treeProvider.refresh();
+                    setTimeout(() => statusBar.hide(), 3000);
+                } else {
+                    statusBar.text = `$(x) Build failed`;
+                    outputChannel.appendLine(`[CMD] ${response.message}`);
+                    if (response.data) {
+                        outputChannel.appendLine(response.data);
+                    }
+                    setTimeout(() => statusBar.hide(), 5000);
+                }
+            } catch (error) {
+                statusBar.text = `$(x) Build failed`;
+                outputChannel.appendLine(`[CMD] Error: ${error}`);
+                setTimeout(() => statusBar.hide(), 3000);
+            }
         })
     );
 
@@ -371,21 +359,11 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('cairn.clear', async () => {
             outputChannel.appendLine('[CMD] CLEAR command triggered');
 
-            // Ensure daemon is running
-            if (!shmClient.isDaemonRunning()) {
-                const started = await ensureDaemonRunning();
-                if (!started) {
-                    statusBar.text = `$(x) Daemon not running`;
-                    setTimeout(() => statusBar.hide(), 3000);
-                    return;
-                }
-            }
-
             statusBar.text = `$(sync~spin) Clearing...`;
             statusBar.show();
 
             try {
-                const response = await shmClient.clear(cwd());
+                const response = await pipeClient.clear(cwd());
 
                 if (response.status === 'Success') {
                     statusBar.text = `$(check) Cleared`;
@@ -418,7 +396,7 @@ export function activate(context: vscode.ExtensionContext) {
             statusBar.show();
 
             try {
-                const response = await shmClient.jump(patchHash, cwd);
+                const response = await pipeClient.jump(patchHash, cwd);
 
                 if (response.status === 'Success') {
                     statusBar.text = `$(check) Switched to ${shortHash}`;

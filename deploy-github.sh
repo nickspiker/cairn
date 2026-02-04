@@ -1,7 +1,9 @@
 #!/bin/bash
 set -e
 
-VERSION="v0.0.0"
+# Extract version from Cargo.toml
+CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+VERSION="${1:-v$CARGO_VERSION}"
 
 echo "Deploying cairn $VERSION to GitHub"
 echo ""
@@ -50,8 +52,7 @@ else
 
 - Multi-platform cairn binaries (Linux, Windows, macOS Intel/ARM64)
 - VSCode extension with auto-download
-- BLAKE3 hash verification
-- Initial v0.0.0 release"
+- BLAKE3 hash verification"
 fi
 
 # Check if remote exists
@@ -74,10 +75,10 @@ echo "Creating GitHub release..."
 
 # Create GitHub release with binaries
 gh release create "$VERSION" \
-    --title "$VERSION - Initial Release" \
-    --notes "# Cairn v0.0.0
+    --title "Cairn $VERSION" \
+    --notes "# Cairn $VERSION
 
-**Patch-based version control for successful Rust builds**
+**Build-gated version control for Rust projects**
 
 ## Features
 - Auto-creates patches after successful \`cargo build\`
@@ -121,6 +122,6 @@ echo ""
 echo "Release URL: https://github.com/nickspiker/cairn/releases/tag/$VERSION"
 echo ""
 echo "Next steps:"
-echo "  1. Test extension download: code --install-extension vscode-extension/cairn-0.0.0.vsix --force"
-echo "  2. Reload VSCode and test auto-download"
-echo "  3. If all works, publish to marketplace: cd vscode-extension && vsce publish"
+echo "  1. Verify release at: https://github.com/nickspiker/cairn/releases/tag/$VERSION"
+echo "  2. Test binary downloads from release page"
+echo "  3. Update VSCode extension if needed: cd vscode-extension && vsce publish"

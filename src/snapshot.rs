@@ -12,7 +12,6 @@ use crate::patch_storage::{PatchInfo, create_patch};
 use crate::state::RepositoryState;
 use crate::tree;
 use anyhow::{Context, Result};
-use blake3::Hash;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -30,7 +29,6 @@ use std::path::PathBuf;
 pub fn create_snapshot_from_files(
     cairn_dir: &PathBuf,
     message: String,
-    build_hash: Hash,
     current_files: HashMap<PathBuf, Vec<u8>>,
 ) -> Result<String> {
     // Load current repository state
@@ -38,6 +36,7 @@ pub fn create_snapshot_from_files(
         RepositoryState::load(cairn_dir).context("Failed to load repository state")?;
 
     // 1. Store all files as blobs and get their hashes
+    println!("Storing {} files as blobs...", current_files.len());
     let mut file_to_blob = HashMap::new();
     for (path, content) in &current_files {
         let blob_hash = blob::store_blob(content)
@@ -46,6 +45,7 @@ pub fn create_snapshot_from_files(
     }
 
     // 2. Create tree from file→blob mappings
+    println!("Creating tree from {} file mappings...", file_to_blob.len());
     let tree_hp = tree::create_tree(&file_to_blob)
         .context("Failed to create tree")?;
 
@@ -76,9 +76,9 @@ pub fn create_snapshot_from_files(
     }
 
     // 5. Create patch with tree reference
+    println!("Creating patch...");
     let patch_info = PatchInfo {
         message,
-        build_hash: *build_hash.as_bytes(),
         tree_hp,
         parent_patch_hp,
         file_diffs: None,  // TODO: Compute diffs for space optimization
@@ -89,8 +89,10 @@ pub fn create_snapshot_from_files(
 
     // 6. Encode patch hash as base58 for the patch ID
     let patch_id = base58_encode(&patch_hp);
+    println!("Patch ID: {}", patch_id);
 
     // 7. Update repository state with new patch and tree hash
+    println!("Updating repository state...");
     repo_state.add_patch(patch_id.clone(), tree_hp);
     repo_state
         .save(cairn_dir)
@@ -107,7 +109,7 @@ pub fn create_snapshot_from_files(
 ///
 /// This is a legacy function that creates a complete snapshot.
 /// New code should use the incremental scan_working_directory + create_snapshot_from_files.
-pub fn create_snapshot(cairn_dir: &PathBuf, message: String, build_hash: Hash) -> Result<String> {
+pub fn create_snapshot(cairn_dir: &PathBuf, message: String) -> Result<String> {
     // Load state
     let state = crate::state::RepositoryState::load(cairn_dir)
         .context("Failed to load repository state")?;
@@ -121,7 +123,7 @@ pub fn create_snapshot(cairn_dir: &PathBuf, message: String, build_hash: Hash) -
     all_files.extend(scan_result.modified.clone());
 
     // Create snapshot from those files
-    create_snapshot_from_files(cairn_dir, message, build_hash, all_files)
+    create_snapshot_from_files(cairn_dir, message, all_files)
 }
 
 /// Scan working directory for all files

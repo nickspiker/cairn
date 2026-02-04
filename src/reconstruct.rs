@@ -9,10 +9,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::blob::{load_blob, store_blob};
-use crate::patch_storage::{load_patch, Patch};
-use crate::diff::compute_byte_level_diff;
+use crate::blob::load_blob;
 use crate::patch::ByteOp;
+use crate::patch_storage::load_patch;
 use crate::state::Blake3Hash;
 use crate::tree::load_tree;
 
@@ -158,55 +157,6 @@ pub fn reconstruct_file_at_patch(
     Ok(content)
 }
 
-/// Compute reverse diff operations (child → parent)
-///
-/// Given operations that transform old → new,
-/// compute operations that transform new → old.
-///
-/// Used for backward reconstruction through patch history.
-pub fn reverse_diff_operations(
-    old_content: &[u8],
-    new_content: &[u8],
-) -> Vec<ByteOp> {
-    // Simply compute diff in reverse direction
-    compute_byte_level_diff(new_content, old_content)
-}
-
-/// Verify diff correctness by round-trip reconstruction
-///
-/// Applies forward diff, then reverse diff, and checks we get back original.
-/// This is a sanity check for diff quality.
-pub fn verify_diff_roundtrip(
-    old_content: &[u8],
-    new_content: &[u8],
-    forward_ops: &[ByteOp],
-) -> Result<()> {
-    // Forward: old + forward_ops = new
-    let reconstructed_new = apply_diff_forward(old_content, forward_ops)?;
-
-    if reconstructed_new != new_content {
-        anyhow::bail!(
-            "Forward diff failed: reconstructed {} bytes, expected {} bytes",
-            reconstructed_new.len(),
-            new_content.len()
-        );
-    }
-
-    // Backward: compute reverse and apply
-    let reverse_ops = reverse_diff_operations(old_content, new_content);
-    let reconstructed_old = apply_diff_forward(new_content, &reverse_ops)?;
-
-    if reconstructed_old != old_content {
-        anyhow::bail!(
-            "Reverse diff failed: reconstructed {} bytes, expected {} bytes",
-            reconstructed_old.len(),
-            old_content.len()
-        );
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,34 +221,6 @@ mod tests {
 
         let result = apply_diff_forward(base, &ops);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_reverse_diff() {
-        let old = b"hello world";
-        let new = b"hello beautiful world";
-
-        let forward_ops = compute_byte_level_diff(old, new);
-        let reverse_ops = reverse_diff_operations(old, new);
-
-        // Apply forward
-        let reconstructed_new = apply_diff_forward(old, &forward_ops).unwrap();
-        assert_eq!(reconstructed_new, new);
-
-        // Apply reverse
-        let reconstructed_old = apply_diff_forward(new, &reverse_ops).unwrap();
-        assert_eq!(reconstructed_old, old);
-    }
-
-    #[test]
-    fn test_verify_diff_roundtrip_success() {
-        let old = b"original content\nline 2\n";
-        let new = b"modified content\nline 2\nextra line\n";
-
-        let ops = compute_byte_level_diff(old, new);
-        let result = verify_diff_roundtrip(old, new, &ops);
-
-        assert!(result.is_ok());
     }
 
     #[test]

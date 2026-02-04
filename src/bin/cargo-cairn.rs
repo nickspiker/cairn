@@ -7,10 +7,8 @@
 //! what cargo compiled.
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
-use std::sync::atomic::{AtomicU32, Ordering};
-use shared_memory::ShmemConf;
 
 fn main() {
     if let Err(e) = run() {
@@ -92,9 +90,7 @@ fn run() -> Result<()> {
             eprintln!("⚠️  Cairn: Failed to create patch: {}", e);
         } else {
             println!("✓ Cairn: Patch created");
-
-            // Notify daemon via shared memory that patches changed
-            notify_daemon_patches_changed();
+            // Note: Daemon will detect new patches when extension refreshes
         }
     } else if snapshot_taken {
         // Build failed - discard the snapshot
@@ -136,6 +132,45 @@ fn create_pending_snapshot() -> Result<bool> {
     Ok(true)
 }
 
+/// Scan tracked paths and return all files with their content
+fn scan_tracked_files(tracked_paths: &[PathBuf]) -> Result<std::collections::HashMap<PathBuf, Vec<u8>>> {
+    let mut files = std::collections::HashMap::new();
+
+    for tracked_path in tracked_paths {
+        if tracked_path.is_file() {
+            let content = std::fs::read(tracked_path)?;
+            files.insert(tracked_path.clone(), content);
+        } else if tracked_path.is_dir() {
+            scan_directory(tracked_path, &mut files)?;
+        }
+    }
+
+    Ok(files)
+}
+
+/// Recursively scan a directory for files
+fn scan_directory(dir: &Path, files: &mut std::collections::HashMap<PathBuf, Vec<u8>>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            let dir_name = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if dir_name.starts_with('.') || dir_name == "target" || dir_name == "node_modules" {
+                continue;
+            }
+            scan_directory(&path, files)?;
+        } else if path.is_file() {
+            let content = std::fs::read(&path)?;
+            files.insert(path, content);
+        }
+    }
+
+    Ok(())
+}
+
 /// Commit the pending snapshot as a real patch using Git-style architecture
 fn save_pending_snapshot() -> Result<()> {
     let cairn_dir = PathBuf::from(".cairn");
@@ -171,66 +206,107 @@ fn save_pending_snapshot() -> Result<()> {
         None
     };
 
-    // 1. Scan tracked files and store blobs
-    let file_to_blob = cairn::blob::scan_and_store_blobs(&state.tracked_paths)
-        .context("Failed to scan and store blobs")?;
+    // 1. Load parent tree if exists (needed for selective blob storage)
+    let parent_tree = if let Some(parent_hp) = parent_patch_hp {
+        let parent_patch = cairn::patch_storage::load_patch(&cairn_dir, &parent_hp)
+            .context("Failed to load parent patch")?;
+        Some(cairn::tree::load_tree(&cairn_dir, &parent_patch.tree_hp)
+            .context("Failed to load parent tree")?)
+    } else {
+        None
+    };
 
-    // 2. Create tree from blob references
+    // 2. Scan all files from tracked paths (handles directories)
+    let all_files = scan_tracked_files(&state.tracked_paths)?;
+
+    // 3. Selective blob storage: store full blobs only for new files or chain resets
+    let mut file_to_blob = std::collections::HashMap::new();
+    let mut file_diffs_data = std::collections::HashMap::new(); // Store diff info while building
+
+    for (path, new_content) in all_files {
+
+        if let Some(ref parent_tree_map) = parent_tree {
+            if let Some(old_blob_hash) = parent_tree_map.get(&path) {
+                // Check if file actually changed by comparing content hashes
+                let new_content_hash = blake3::hash(&new_content);
+                let new_hash_bytes = *new_content_hash.as_bytes();
+
+                if new_hash_bytes == *old_blob_hash {
+                    // File UNCHANGED - just reference existing blob, no diff entry
+                    file_to_blob.insert(path.clone(), *old_blob_hash);
+                    // Don't add to file_diffs_data - unchanged files omitted from diffs
+                } else {
+                    // File MODIFIED - create diff entry
+                    let old_content = cairn::blob::load_blob(&cairn_dir, old_blob_hash)
+                        .context("Failed to load old blob")?;
+                    let diff_ops = cairn::diff::compute_byte_level_diff(&old_content, &new_content);
+
+                    let chain_size = compute_chain_size(&cairn_dir, &path,
+                        &parent_patch_hp.expect("parent_hp should exist here"))
+                        .unwrap_or(0);
+
+                    if chain_size < new_content.len() {
+                        // Use diff strategy - DON'T store new blob, use content hash
+                        file_to_blob.insert(path.clone(), new_hash_bytes);
+
+                        file_diffs_data.insert(path.clone(), (
+                            cairn::patch_storage::DiffStrategy::Diff,
+                            *old_blob_hash,
+                            new_hash_bytes,
+                            diff_ops
+                        ));
+                    } else {
+                        // Chain reset - store new blob
+                        let new_blob_hash = cairn::blob::store_blob(&new_content)
+                            .context("Failed to store blob")?;
+                        file_to_blob.insert(path.clone(), new_blob_hash);
+
+                        file_diffs_data.insert(path.clone(), (
+                            cairn::patch_storage::DiffStrategy::NewBlob,
+                            *old_blob_hash,
+                            new_blob_hash,
+                            vec![] // No diff ops for NewBlob strategy
+                        ));
+                    }
+                }
+            } else {
+                // NEW file (not in parent) - store full blob as base
+                let new_blob_hash = cairn::blob::store_blob(&new_content)
+                    .context("Failed to store blob")?;
+                file_to_blob.insert(path.clone(), new_blob_hash);
+
+                file_diffs_data.insert(path.clone(), (
+                    cairn::patch_storage::DiffStrategy::Diff,
+                    [0u8; 32], // No old blob
+                    new_blob_hash,
+                    vec![cairn::patch::ByteOp::Insert { content: new_content }]
+                ));
+            }
+        } else {
+            // No parent - store all files as full blobs
+            let new_blob_hash = cairn::blob::store_blob(&new_content)
+                .context("Failed to store blob")?;
+            file_to_blob.insert(path.clone(), new_blob_hash);
+        }
+    }
+
+    // 3. Create tree from blob references (virtual or real)
     let tree_hp = cairn::tree::create_tree(&file_to_blob)
         .context("Failed to create tree")?;
 
-    // 3. Compute diffs from parent (if exists)
-    let file_diffs = if let Some(parent_hp) = parent_patch_hp {
-        // Load parent patch and tree
-        let parent_patch = cairn::patch_storage::load_patch(&cairn_dir, &parent_hp)
-            .context("Failed to load parent patch")?;
-        let parent_tree = cairn::tree::load_tree(&cairn_dir, &parent_patch.tree_hp)
-            .context("Failed to load parent tree")?;
-
+    // 4. Build file_diffs from collected data
+    let file_diffs = if parent_patch_hp.is_some() {
         let mut diffs = std::collections::HashMap::new();
 
-        // For each file in current tree, check if it changed
-        for (path, new_blob_hash) in &file_to_blob {
-            if let Some(old_blob_hash) = parent_tree.get(path) {
-                // File exists in parent - check if content changed
-                if old_blob_hash != new_blob_hash {
-                    // File modified - compute byte-level diff
-                    let old_content = cairn::blob::load_blob(&cairn_dir, old_blob_hash)
-                        .context("Failed to load old blob")?;
-                    let new_content = cairn::blob::load_blob(&cairn_dir, new_blob_hash)
-                        .context("Failed to load new blob")?;
-
-                    let diff_ops = cairn::diff::compute_byte_level_diff(&old_content, &new_content);
-
-                    // TODO: Implement chain optimization using should_create_new_snapshot
-                    // For now, always use diff strategy
-                    let file_diff = cairn::patch_storage::FileDiff {
-                        strategy: cairn::patch_storage::DiffStrategy::Diff,
-                        old_blob: *old_blob_hash,
-                        new_blob: *new_blob_hash,
-                        ops: diff_ops,
-                    };
-                    diffs.insert(path.clone(), file_diff);
-                }
-                // If hashes same, no diff needed (file unchanged)
-            } else {
-                // File added (not in parent) - store full content as Insert
-                let new_content = cairn::blob::load_blob(&cairn_dir, new_blob_hash)
-                    .context("Failed to load new blob")?;
-                let file_diff = cairn::patch_storage::FileDiff {
-                    strategy: cairn::patch_storage::DiffStrategy::Diff,
-                    old_blob: [0u8; 32],  // No old blob for new file
-                    new_blob: *new_blob_hash,
-                    ops: vec![cairn::patch::ByteOp::Insert {
-                        content: new_content,
-                    }],
-                };
-                diffs.insert(path.clone(), file_diff);
-            }
+        for (path, (strategy, old_blob, new_blob, ops)) in file_diffs_data {
+            let file_diff = cairn::patch_storage::FileDiff {
+                strategy,
+                old_blob,
+                new_blob,
+                ops,
+            };
+            diffs.insert(path, file_diff);
         }
-
-        // Note: Deleted files (in parent but not current) are represented
-        // by absence from current tree - no explicit diff needed
 
         Some(diffs)
     } else {
@@ -238,10 +314,8 @@ fn save_pending_snapshot() -> Result<()> {
     };
 
     // 4. Create patch with tree reference and diffs
-    let build_hash = *blake3::hash(b"cargo-cairn build").as_bytes();
     let patch_info = cairn::patch_storage::PatchInfo {
         message: "Successful build".to_string(),
-        build_hash,
         tree_hp,
         parent_patch_hp,
         file_diffs,
@@ -275,31 +349,42 @@ fn discard_pending_snapshot() -> Result<()> {
     Ok(())
 }
 
-/// Notify daemon that patches have changed via shared memory event flag
-fn notify_daemon_patches_changed() {
-    const EVENT_PATCHES_CHANGED: u32 = 0x01;
+/// Compute cumulative diff chain size for a file
+fn compute_chain_size(
+    cairn_dir: &Path,
+    file_path: &Path,
+    parent_hp: &[u8; 32],
+) -> Result<usize> {
+    let mut chain_size = 0;
+    let mut current_hp = Some(*parent_hp);
 
-    // Try to open shared memory and set event flag (non-fatal if daemon not running)
-    if let Ok(shmem) = ShmemConf::new()
-        .size(2060)
-        .os_id("cairn-daemon-shm")
-        .open()
-    {
-        unsafe {
-            // Shared memory layout: [lock: u64][events: u32][...buffers]
-            let events_ptr = shmem.as_ptr().add(8) as *const AtomicU32;
-            let events = &*events_ptr;
-            events.fetch_or(EVENT_PATCHES_CHANGED, Ordering::Release);
+    while let Some(hp) = current_hp {
+        let patch = cairn::patch_storage::load_patch(cairn_dir, &hp)?;
+
+        if let Some(diffs) = &patch.file_diffs {
+            if let Some(diff) = diffs.get(file_path) {
+                match diff.strategy {
+                    cairn::patch_storage::DiffStrategy::Diff => {
+                        chain_size += estimate_diff_size(&diff.ops);
+                    }
+                    cairn::patch_storage::DiffStrategy::NewBlob => {
+                        break; // Chain reset
+                    }
+                }
+            }
         }
+        current_hp = patch.parent_patch_hp;
     }
 
-    // Also write signal file for extension file watcher (event-driven, no polling)
-    let signal_file = PathBuf::from(".cairn/.event");
-    let _ = std::fs::write(&signal_file, &std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-        .to_le_bytes());
+    Ok(chain_size)
+}
+
+/// Estimate storage size of diff operations
+fn estimate_diff_size(ops: &[cairn::patch::ByteOp]) -> usize {
+    ops.iter().map(|op| match op {
+        cairn::patch::ByteOp::Copy { .. } => 8, // Overhead for copy operation
+        cairn::patch::ByteOp::Insert { content } => content.len()
+    }).sum()
 }
 
 /// Auto-initialize cairn repository with flat directory structure

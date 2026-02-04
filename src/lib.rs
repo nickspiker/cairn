@@ -1,6 +1,5 @@
 //! Cairn - Patch-based version control for successful cargo builds
 
-pub mod apply;
 pub mod blob;
 pub mod daemon;
 pub mod decode;

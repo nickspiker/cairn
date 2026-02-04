@@ -2,15 +2,11 @@
 
 **Build-gated version control for Rust projects.**
 
-> **⚠️ EXPERIMENTAL - v0.0.0 - NOT PRODUCTION READY**
+> **⚠️ EXPERIMENTAL - v0.0.1 - NOT PRODUCTION READY**
 >
-> **Do not use on critical projects.** While all data is hash-verified and should not corrupt, there are known issues:
-> - Rollback may not properly roll forward on subsequent builds
-> - Some edge cases in snapshot restoration
+> **Do not use on critical projects.** While all data is hash-verified and should not corrupt, this extension is new and not extensively tested yet:
 >
-> This release is for testing and claiming the crate name. Actively developed on Linux only. Windows/macOS untested.
->
-> **Use at your own risk. Always have git backups.**
+> **Use at your own risk. Always have backups.**
 
 ---
 
@@ -20,7 +16,7 @@ You code for 3 hours. Run `cargo build`. 500 errors. Don't remember what changed
 
 Git shows 800 lines across 12 files. You spend 2 hours trying to undo changes. Finally `git reset --hard`, losing everything.
 
-**Cairn solves this:** Every successful build auto-captures as a patch. Instant rollback to any working state.
+**Cairn solves this:** Every successful build auto-captures as a patch. Jump to any working state instantly.
 
 ---
 
@@ -30,47 +26,31 @@ Git shows 800 lines across 12 files. You spend 2 hours trying to undo changes. F
 
 1. Install from VSCode Marketplace: search "Cairn"
 2. Open a Rust project
-3. Click **Build** in the Cairn Build Commands panel (opens terminal with `cargo cairn build`)
-4. Done! Cairn auto-initializes and creates your first patch
+3. Click **Build** in the Cairn Build Commands panel or by using the terminal extension with `cargo cairn build`
+4. Cairn auto-initializes and creates your first patch if the build is successful
 
-The extension is a **viewer only** - it displays your patch history but runs builds in the integrated terminal. This keeps things simple and prevents any hanging issues.
-
-### CLI
+### CLI for agent use and those who prefer terminal commands
 
 ```bash
 # Install cargo-cairn (the build wrapper)
 cargo install cairn
 
 # Use it instead of cargo build
-cargo cairn build
-cargo cairn test
-cargo cairn build --release
+cairn build
+cairn test
+cairn build --release
 ```
 
 On first run, cairn auto-creates `.cairn/` - no init needed.
-
-### Optional: Shell Aliases (for convenience)
-
-Add to your `~/.bashrc` or `~/.zshrc`:
-
-```bash
-alias cb='cargo cairn build'
-alias ct='cargo cairn test'
-alias cr='cargo cairn run'
-```
-
-Now you can type `cb` instead of `cargo cairn build`!
-
-> **Note:** Cargo won't let you override built-in commands like `build` in `.cargo/config.toml`, so shell aliases are the way to go.
 
 ---
 
 ## How It Works
 
 ```bash
-$ cargo cairn build
+$ cairn build
 📸 Cairn: Snapshotting current state...
-   Compiling myproject v0.1.0
+   Compiling myproject v0.0.0
     Finished dev [unoptimized + debuginfo] target(s) in 2.34s
 ✓ Cairn: Patch created
 
@@ -82,7 +62,7 @@ Patches (newest first):
   #0   swift-ocean-light-paper-wind
 ```
 
-**Key insight:** `cargo cairn` snapshots your code BEFORE the build starts, then only saves the patch if the build succeeds. This guarantees the patch matches exactly what was compiled.
+**Key insight:** `cargo cairn` snapshots your code BEFORE the build starts, then only saves the patch if the build succeeds. This guarantees the patch matches exactly what was compiled even if edits are done during compilation.
 
 ---
 
@@ -90,71 +70,66 @@ Patches (newest first):
 
 **Automatic patches on successful builds:**
 - Build succeeds → patch created automatically
-- Build fails → nothing saved
-- No manual commands (compiler is the gatekeeper)
+- Build fails → patch created and discarded, nothing saved
 
-**Instant rollback:**
+**Switch between patches:**
 ```bash
-$ cairn rollback cloud-river-stone-bright-moon
-✓ Rolled back to patch cloud-river-stone-bright-moon
-  47 files updated
+$ cairn jump cloud-river-stone-bright-moon
+✓ Switched to patch cloud-river-stone-bright-moon
+  47 files restored
 
 $ cargo build
-    Finished dev in 0.23s  # Guaranteed to work
+    Finished dev in 0.23s
 ```
 
-**Mnemonic patch IDs:**
-- 5-word phrases instead of git hashes
+**Mnemonic encoding:**
+- Uses VSF's 3177-word list (11.63 ish bits per word)
+- 5 words = 58 bits ≈ 288 quadrillion combinations
+- Birthday paradox: 50% collision at ~537 million patches
+- 288 quadrillion combinations
+- Birthday bound: 537M patches (1000 patches/day for 1000 years won't reach it)
 - Easy to remember: "maple-crane-forest-pixel-dance"
-- Partial matching: `cairn rollback maple` works
 
 **VSCode Extension:**
 - Visual patch history in Explorer sidebar
-- Click-to-rollback (white dot = current, black dot = click to go there)
+- Click to switch patches (white dot = current, black dot = click to jump there)
 - Configurable build command buttons
-- No terminal spawning - clean notifications
+- Daemon-based communication with clean notifications
 
 ---
 
 ## Installation
 
-### From Source (Recommended for now)
+### VSCode Extension (Recommended)
+
+Install from VSCode Marketplace: search "Cairn" by nickspiker
+
+The extension automatically handles the CLI installation.
+
+### CLI Only (Optional)
+
+If you prefer using the CLI without the VSCode extension:
 
 ```bash
-git clone https://github.com/nickspiker/cairn
-cd cairn
-cargo install --path .
+cargo install cairn
 ```
 
 This installs both `cairn` (CLI) and `cargo-cairn` (build wrapper).
-
-### VSCode Extension
-
-Install from marketplace: search "Cairn" by nickspiker
-
-Or install manually:
-```bash
-cd vscode-extension
-npm install
-npm run compile
-vsce package
-# Then: Extensions → Install from VSIX
-```
 
 ---
 
 ## CLI Reference
 
 ```bash
-cairn                    # Show help
-cairn init               # Initialize .cairn/ (optional - auto-inits on first build)
 cairn list               # List all patches
 cairn show <patch-id>    # Show patch details
-cairn rollback <patch-id> # Rollback to a patch
+cairn jump <patch-id>    # Switch to a different patch
+cairn clear              # Delete all patch history
 
-cargo cairn build        # Build with auto-snapshot
-cargo cairn test         # Test with auto-snapshot
-cargo cairn build --release  # Release build with auto-snapshot
+cairn build              # Build with auto-snapshot
+cairn test               # Test with auto-snapshot
+cairn run                # Run with auto-snapshot
+cairn build --release    # Any cargo args work
 ```
 
 ---
@@ -182,17 +157,42 @@ Configure build commands in settings.json:
 ```
 .cairn/
 ├── state.vsf           # Current state + patch list
-└── patches/            # VSF-encoded patches (content-addressed)
-    ├── xiN2nO...lKI
-    └── a3f8d9...e1b
+├── blobs/              # Content-addressed file storage (BLAKE3)
+│   ├── 2XUfz4n9...
+│   └── ELp5CGJt...
+├── trees/              # Directory snapshots (path→blob mappings)
+│   └── Qrf5unc2...
+└── patches/            # VSF-encoded patches
+    ├── Qrf5unc2...     # First patch (references tree + full blobs)
+    └── 6MNSUfvY...     # Later patch (references tree + diffs)
 ```
 
-**Patch format (VSF-encoded):**
-- Author ID (BLAKE3 hash of git user.name + email)
-- Parent patch pointer (cryptographic chain)
-- Timestamp
-- Delta operations (InsertLine, DeleteLine, AddFile, etc.)
-- Build hash
+**Storage architecture (inspired by Git):**
+
+1. **Blobs** - Raw file content, stored once, referenced by BLAKE3 hash
+   - Deduplicated: identical files share the same blob
+   - Content-addressed: same content = same hash = stored once
+
+2. **Trees** - Directory snapshots mapping file paths to blob hashes
+   - Captures complete project state at a point in time
+   - Enables fast diff comparison between patches
+
+3. **Patches** - Contain:
+   - Tree reference (directory snapshot)
+   - Parent patch pointer (cryptographic chain)
+   - Per-file diffs (binary operations)
+   - Message ("Successful build")
+
+**Diff-only storage:**
+- **First file version**: Full blob stored
+- **Modified files**: Only diff operations stored (no redundant blob)
+- **Unchanged files**: Tree points to existing blob (no diff, no new blob)
+- **Chain resets**: When diff chain grows larger than file, store new full blob
+
+**Binary diff format:**
+- `Copy {start, len}` - Copy bytes from old version
+- `Insert {content}` - Insert new bytes
+- Files reconstructed by: load base blob → apply diff chain forward
 
 **Excluded from snapshots:**
 - `.cairn/`, `target/`, `.git/`, `node_modules/`, `out/`, `dist/`
@@ -214,7 +214,7 @@ Cairn doesn't replace Git. It solves a different problem: "give me the last stat
 git checkout -b feature
 cargo cairn build    # Snapshot as you develop
 cargo cairn build    # Each successful build = new patch
-cairn rollback ...   # Oops, go back
+cairn jump ...       # Oops, jump to previous working patch
 cargo cairn build    # Try again
 git add -A && git commit  # When ready, commit to git
 ```
@@ -225,7 +225,7 @@ git add -A && git commit  # When ready, commit to git
 
 **Current stability issues:**
 - Random build hangs (investigating)
-- Rollback may not cleanly roll forward on next build
+- Jump may not cleanly restore state in edge cases
 - Snapshot saves may silently fail in edge cases
 
 **Design limitations:**
@@ -261,5 +261,3 @@ MIT or Apache-2.0, your choice.
 ---
 
 **Cairn: Because every successful build deserves to be saved.**
-# Test
-# Test

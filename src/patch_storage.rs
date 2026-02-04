@@ -1,18 +1,18 @@
-//! Patch storage - build metadata with tree references and parent chain
+//! Patch storage - metadata with tree references and parent chain
 //!
 //! Patches are VSF files that record successful builds with:
-//! - Build metadata (timestamp, message, build hash)
+//! - Metadata (message) - stored but not part of patch identity
 //! - Tree reference (root directory structure)
 //! - Optional parent reference (for patch chain)
 //!
-//! Each patch is identified by its provenance hash (hp = BLAKE3(patch_vsf)),
-//! which includes Eagle Time to ensure uniqueness.
+//! Each patch is identified by its provenance hash (hp), which is computed from
+//! ONLY the source code content (tree_hp + parent_hp + diffs), NOT metadata.
+//! This ensures identical source code produces identical patch IDs, enabling
+//! true content-based deduplication.
 //!
 //! Patch VSF format:
 //! ```text
 //! [patch_metadata
-//!   timestamp: eu6{oscillations}
-//!   build_hash: hb"..."
 //!   message: x"Successful build"
 //! ]
 //! [tree
@@ -26,9 +26,6 @@
 use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::path::{Path, PathBuf};
-use vsf::types::EtType;
-use vsf::types::eagle_time;
-use vsf::verification::compute_provenance_hash;
 use vsf::{VsfBuilder, VsfSection, VsfType};
 
 use crate::hash_encoding::base58_encode;
@@ -41,8 +38,6 @@ use std::collections::HashMap;
 pub struct PatchInfo {
     /// Patch message (e.g., "Successful build")
     pub message: String,
-    /// Build output hash (BLAKE3 of cargo output)
-    pub build_hash: Blake3Hash,
     /// Tree provenance hash (hp) - references directory structure
     pub tree_hp: Blake3Hash,
     /// Parent patch provenance hash (hp) - None for first patch
@@ -88,10 +83,6 @@ pub struct FileDiff {
 pub struct Patch {
     /// Patch message
     pub message: String,
-    /// Build output hash
-    pub build_hash: Blake3Hash,
-    /// Eagle Time timestamp (oscillations since epoch)
-    pub timestamp: u64,
     /// Tree provenance hash
     pub tree_hp: Blake3Hash,
     /// Parent patch provenance hash (None for first patch)
@@ -102,22 +93,39 @@ pub struct Patch {
 
 /// Create a patch from metadata
 ///
-/// Returns the patch's provenance hash (hp), which includes Eagle Time
-/// for collision-free uniqueness.
+/// Returns the patch's provenance hash (hp), which is computed from ONLY
+/// the source code content (tree_hp + parent_hp + diffs). Message is
+/// stored in the VSF but NOT included in the hash calculation,
+/// ensuring identical source code produces identical patch IDs.
 ///
 /// # Arguments
 /// * `info` - Patch metadata (message, build hash, tree, parent)
 ///
 /// # Returns
-/// * `Blake3Hash` - The patch's provenance hash (hp)
+/// * `Blake3Hash` - The patch's content-based provenance hash (hp)
 pub fn create_patch(info: PatchInfo) -> Result<Blake3Hash> {
+    // 1. Patch ID = tree hash (pure content-based)
+    // Identical source files → identical tree hash → identical patch ID
+    // Parent is stored IN the patch VSF, but not part of the ID
+    let content_hash = info.tree_hp;
+
+    // 2. Check if patch with this content already exists
+    let patches_dir = PathBuf::from(".cairn/patches");
+    let patch_path = patches_dir.join(format!("{}.vsf", base58_encode(&content_hash)));
+
+    if patch_path.exists() {
+        // Duplicate patch - return existing hash without writing
+        println!("  Patch already exists (content-based deduplication)");
+        return Ok(content_hash);
+    }
+
+    println!("  Creating new patch...");
+
+    // 3. Build VSF for new patch
     let mut builder = VsfBuilder::new();
 
-    // 1. Metadata section with Eagle Time
+    // Metadata section
     let mut metadata = VsfSection::new("patch_metadata");
-    let timestamp = eagle_time::eagle_time_oscillations();
-    metadata.add_field("timestamp", VsfType::e(EtType::u(timestamp)));
-    metadata.add_field("build_hash", VsfType::hb(info.build_hash.to_vec()));
     metadata.add_field("message", VsfType::x(info.message));
     builder = builder.add_section_direct(metadata);
 
@@ -135,7 +143,11 @@ pub fn create_patch(info: PatchInfo) -> Result<Blake3Hash> {
         if let Some(ref diffs) = info.file_diffs {
             let mut diffs_section = VsfSection::new("diffs");
 
-            for (path, diff) in diffs {
+            // Sort entries by path for deterministic hash computation
+            let mut sorted_diffs: Vec<_> = diffs.iter().collect();
+            sorted_diffs.sort_by_key(|(path, _)| path.as_os_str());
+
+            for (path, diff) in sorted_diffs {
                 // Convert path to hex-encoded label (f_{hex})
                 let path_label = path_to_hex_label(path)?;
                 let mut file_diff_section = VsfSection::new(&path_label);
@@ -173,21 +185,14 @@ pub fn create_patch(info: PatchInfo) -> Result<Blake3Hash> {
         builder = builder.add_section_direct(parent_section);
     }
 
-    // 4. Build VSF bytes
+    // 4. Build and write VSF
     let patch_bytes = builder.build().map_err(|e| anyhow!("{}", e))?;
-
-    // 5. Compute provenance hash (includes Eagle Time → unique hp)
-    let hp = compute_provenance_hash(&patch_bytes).map_err(|e| anyhow!("{}", e))?;
-
-    // 6. Write patch to .cairn/patches/{base58_hp}.vsf
-    let patches_dir = PathBuf::from(".cairn/patches");
     fs::create_dir_all(&patches_dir).context("Failed to create patches directory")?;
-
-    let patch_path = patches_dir.join(format!("{}.vsf", base58_encode(&hp)));
     fs::write(&patch_path, &patch_bytes)
-        .with_context(|| format!("Failed to write patch {}", base58_encode(&hp)))?;
+        .with_context(|| format!("Failed to write patch {}", base58_encode(&content_hash)))?;
 
-    Ok(hp)
+    println!("  Wrote patch: {}", base58_encode(&content_hash));
+    Ok(content_hash)
 }
 
 /// Load a patch by its provenance hash
@@ -211,8 +216,6 @@ pub fn load_patch(cairn_dir: &Path, hp: &Blake3Hash) -> Result<Patch> {
 
     // Parse sections
     let mut message = String::new();
-    let mut build_hash = [0u8; 32];
-    let mut timestamp = 0u64;
     let mut tree_hp = [0u8; 32];
     let mut parent_patch_hp = None;
     let mut file_diffs = None;
@@ -232,27 +235,6 @@ pub fn load_patch(cairn_dir: &Path, hp: &Blake3Hash) -> Result<Patch> {
                 if let Some(msg_field) = section.get_field("message") {
                     if let Some(VsfType::x(text)) = msg_field.values.first() {
                         message = text.clone();
-                    }
-                }
-
-                // Extract build hash
-                if let Some(hash_field) = section.get_field("build_hash") {
-                    if let Some(VsfType::hb(hash_vec)) = hash_field.values.first() {
-                        if hash_vec.len() == 32 {
-                            build_hash.copy_from_slice(hash_vec);
-                        }
-                    }
-                }
-
-                // Extract timestamp
-                if let Some(time_field) = section.get_field("timestamp") {
-                    if let Some(VsfType::e(et)) = time_field.values.first() {
-                        timestamp = match et {
-                            EtType::u(val) => *val,
-                            EtType::i(val) => *val as u64,
-                            EtType::f5(val) => *val as u64,
-                            EtType::f6(val) => *val as u64,
-                        };
                     }
                 }
             }
@@ -278,9 +260,105 @@ pub fn load_patch(cairn_dir: &Path, hp: &Blake3Hash) -> Result<Patch> {
                     }
                 }
 
-                // TODO: Extract diffs subsection
-                // Need to figure out how to access nested subsections in VSF
-                // For now, reconstruction will work by loading blobs directly from tree
+                // Extract diffs subsection
+                if let Some(diffs_subsection) = section.get_subsection("diffs") {
+                    let mut diffs_map = std::collections::HashMap::new();
+
+                    // Iterate through file diff subsections
+                    for file_subsection in &diffs_subsection.subsections {
+                        // Decode hex path name (format: "f_7372632f6d61696e2e7273")
+                        let hex_label = &file_subsection.name;
+                        if !hex_label.starts_with("f_") {
+                            continue; // Skip non-file subsections
+                        }
+
+                        let path = match hex_label_to_path(hex_label) {
+                            Ok(p) => p,
+                            Err(_) => continue, // Skip invalid paths
+                        };
+
+                        // Extract strategy
+                        let strategy = if let Some(field) = file_subsection.get_field("strategy") {
+                            if let Some(VsfType::u(val, _)) = field.values.first() {
+                                match *val {
+                                    0 => DiffStrategy::Diff,
+                                    1 => DiffStrategy::NewBlob,
+                                    _ => DiffStrategy::Diff,
+                                }
+                            } else {
+                                DiffStrategy::Diff
+                            }
+                        } else {
+                            DiffStrategy::Diff
+                        };
+
+                        // Extract old_blob hash
+                        let mut old_blob = [0u8; 32];
+                        if let Some(field) = file_subsection.get_field("old_blob") {
+                            if let Some(VsfType::hb(hash_vec)) = field.values.first() {
+                                if hash_vec.len() == 32 {
+                                    old_blob.copy_from_slice(hash_vec);
+                                }
+                            }
+                        }
+
+                        // Extract new_blob hash
+                        let mut new_blob = [0u8; 32];
+                        if let Some(field) = file_subsection.get_field("new_blob") {
+                            if let Some(VsfType::hb(hash_vec)) = field.values.first() {
+                                if hash_vec.len() == 32 {
+                                    new_blob.copy_from_slice(hash_vec);
+                                }
+                            }
+                        }
+
+                        // Extract ops subsection
+                        let mut ops = Vec::new();
+                        if let Some(ops_subsection) = file_subsection.get_subsection("ops") {
+                            for op_subsection in &ops_subsection.subsections {
+                                match op_subsection.name.as_str() {
+                                    "copy" => {
+                                        let start = op_subsection
+                                            .get_field("start")
+                                            .and_then(|f| f.values.first())
+                                            .and_then(|v| v.as_usize())
+                                            .unwrap_or(0);
+
+                                        let len = op_subsection
+                                            .get_field("len")
+                                            .and_then(|f| f.values.first())
+                                            .and_then(|v| v.as_usize())
+                                            .unwrap_or(0);
+
+                                        ops.push(crate::patch::ByteOp::Copy { start, len });
+                                    }
+                                    "insert" => {
+                                        let content = op_subsection
+                                            .get_field("content")
+                                            .and_then(|f| f.values.first())
+                                            .and_then(|v| v.as_bytes())
+                                            .map(|b| b.to_vec())
+                                            .unwrap_or_else(Vec::new);
+
+                                        ops.push(crate::patch::ByteOp::Insert { content });
+                                    }
+                                    _ => {} // Unknown op type
+                                }
+                            }
+                        }
+
+                        // Create FileDiff and add to map
+                        let file_diff = FileDiff {
+                            strategy,
+                            old_blob,
+                            new_blob,
+                            ops,
+                        };
+                        diffs_map.insert(path, file_diff);
+                    }
+
+                    file_diffs = Some(diffs_map);
+                }
             }
             _ => {
                 // Unknown section, skip
@@ -290,8 +368,6 @@ pub fn load_patch(cairn_dir: &Path, hp: &Blake3Hash) -> Result<Patch> {
 
     Ok(Patch {
         message,
-        build_hash,
-        timestamp,
         tree_hp,
         parent_patch_hp,
         file_diffs,
@@ -375,10 +451,8 @@ mod tests {
             let tree_hp = create_tree(&file_to_blob)?;
 
             // Create commit (no parent)
-            let build_hash = *blake3::hash(b"cargo build output").as_bytes();
             let commit_info = PatchInfo {
                 message: "Initial commit".to_string(),
-                build_hash,
                 tree_hp,
                 parent_patch_hp: None,
                 file_diffs: None,
@@ -390,14 +464,13 @@ mod tests {
             assert!(commit_exists(&commit_hp));
 
             // Load commit
-            let loaded = load_patch(&commit_hp)?;
+            let cairn_dir = PathBuf::from(".cairn");
+            let loaded = load_patch(&cairn_dir, &commit_hp)?;
 
             // Verify fields
             assert_eq!(loaded.message, "Initial commit");
-            assert_eq!(loaded.build_hash, build_hash);
             assert_eq!(loaded.tree_hp, tree_hp);
             assert_eq!(loaded.parent_patch_hp, None);
-            assert!(loaded.timestamp > 0);
 
             Ok(())
         })();
@@ -422,7 +495,6 @@ mod tests {
 
             let commit1_info = PatchInfo {
                 message: "First commit".to_string(),
-                build_hash: *blake3::hash(b"build 1").as_bytes(),
                 tree_hp: tree1_hp,
                 parent_patch_hp: None,
                 file_diffs: None,
@@ -437,7 +509,6 @@ mod tests {
 
             let commit2_info = PatchInfo {
                 message: "Second commit".to_string(),
-                build_hash: *blake3::hash(b"build 2").as_bytes(),
                 tree_hp: tree2_hp,
                 parent_patch_hp: Some(commit1_hp),
                 file_diffs: None,
@@ -445,7 +516,8 @@ mod tests {
             let commit2_hp = create_patch(commit2_info)?;
 
             // Load second commit
-            let loaded = load_patch(&commit2_hp)?;
+            let cairn_dir = PathBuf::from(".cairn");
+            let loaded = load_patch(&cairn_dir, &commit2_hp)?;
 
             // Verify parent reference
             assert_eq!(loaded.message, "Second commit");
@@ -460,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_provenance_hash_includes_eagle_time() -> Result<()> {
+    fn test_commit_content_based_hashing() -> Result<()> {
         let _lock = TEST_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new()?;
         let original_dir = std::env::current_dir()?;
@@ -474,39 +546,35 @@ mod tests {
             let tree_hp = create_tree(&file_to_blob)?;
 
             // Create first commit
-            let build_hash = *blake3::hash(b"build").as_bytes();
             let commit1_info = PatchInfo {
                 message: "Test commit".to_string(),
-                build_hash,
                 tree_hp,
                 parent_patch_hp: None,
                 file_diffs: None,
             };
             let commit1_hp = create_patch(commit1_info)?;
 
-            // Wait a tiny bit
-            std::thread::sleep(std::time::Duration::from_micros(1));
-
-            // Create second commit with identical content
+            // Create second commit with identical tree but DIFFERENT message
             let commit2_info = PatchInfo {
-                message: "Test commit".to_string(),
-                build_hash,
+                message: "Different message".to_string(),
                 tree_hp,
                 parent_patch_hp: None,
                 file_diffs: None,
             };
             let commit2_hp = create_patch(commit2_info)?;
 
-            // Patchs should have different hp due to Eagle Time
-            assert_ne!(
+            // Patches should have identical hp since tree content is identical
+            // (message is metadata only, not part of patch identity)
+            assert_eq!(
                 commit1_hp, commit2_hp,
-                "Patchs with identical content should have different hp due to Eagle Time"
+                "Patches with identical tree should have identical hp regardless of message"
             );
 
-            // But both should reference the same tree
-            let loaded1 = load_patch(&commit1_hp)?;
-            let loaded2 = load_patch(&commit2_hp)?;
-            assert_eq!(loaded1.tree_hp, loaded2.tree_hp);
+            // Load and verify the first patch still has its original metadata
+            let cairn_dir = PathBuf::from(".cairn");
+            let loaded = load_patch(&cairn_dir, &commit1_hp)?;
+            assert_eq!(loaded.tree_hp, tree_hp);
+            assert_eq!(loaded.message, "Test commit");
 
             Ok(())
         })();
@@ -535,7 +603,6 @@ mod tests {
 
                 let commit_info = PatchInfo {
                     message: format!("Patch {}", i),
-                    build_hash: *blake3::hash(format!("build {}", i).as_bytes()).as_bytes(),
                     tree_hp,
                     parent_patch_hp: parent_hp,
                     file_diffs: None,
@@ -547,13 +614,14 @@ mod tests {
             }
 
             // Verify chain: commit 2 → commit 1 → commit 0
-            let commit2 = load_patch(&commits[2])?;
+            let cairn_dir = PathBuf::from(".cairn");
+            let commit2 = load_patch(&cairn_dir, &commits[2])?;
             assert_eq!(commit2.parent_patch_hp, Some(commits[1]));
 
-            let commit1 = load_patch(&commits[1])?;
+            let commit1 = load_patch(&cairn_dir, &commits[1])?;
             assert_eq!(commit1.parent_patch_hp, Some(commits[0]));
 
-            let commit0 = load_patch(&commits[0])?;
+            let commit0 = load_patch(&cairn_dir, &commits[0])?;
             assert_eq!(commit0.parent_patch_hp, None);
 
             Ok(())

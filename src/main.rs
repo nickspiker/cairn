@@ -6,7 +6,6 @@
 //! - Minimal storage (line-based diffs)
 //! - Easy rollback to any successful build state
 
-mod apply;
 mod blob;
 mod daemon;
 mod decode;
@@ -100,7 +99,7 @@ fn main() -> Result<()> {
             cmd_clear()?;
         }
         Commands::Daemon => {
-            daemon::start_daemon()?;
+            daemon::run_daemon()?;
         }
         Commands::Current => {
             cmd_current()?;
@@ -177,22 +176,36 @@ fn cmd_show(patch_id: &str) -> Result<()> {
     // Find patch by prefix match (supports both mnemonic and base64url)
     let full_patch_id = find_patch_by_id(&repo_state.patches, patch_id)?;
 
-    // Load the patch file
-    let patch_path = cairn_dir.join("patches").join(&full_patch_id);
-    let patch_bytes = fs::read(&patch_path)
-        .with_context(|| format!("Failed to read patch file: {:?}", patch_path))?;
+    // Parse patch hash
+    let patch_bytes = hash_encoding::base58_decode(&full_patch_id)?;
+    if patch_bytes.len() != 32 {
+        anyhow::bail!("Invalid patch hash length: expected 32 bytes, got {}", patch_bytes.len());
+    }
+    let mut patch_hp = [0u8; 32];
+    patch_hp.copy_from_slice(&patch_bytes);
 
-    let patch = patch::Patch::decode_vsf(&patch_bytes).context("Failed to decode patch")?;
+    // Load the patch using new system
+    let patch = patch_storage::load_patch(&cairn_dir, &patch_hp)
+        .context("Failed to load patch")?;
 
     // Display patch information with mnemonic
     let mnemonic = mnemonic::patch_id_to_mnemonic(&full_patch_id, 5)
         .unwrap_or_else(|_| format!("{}...", &full_patch_id[..16]));
 
     println!("Patch: {} ({})", mnemonic, &full_patch_id[..16]);
-    println!("Author: {}", hex::encode(&patch.metadata.author));
-    println!("Message: {}", patch.metadata.message);
+    println!("Message: {}", patch.message);
+    println!("Tree: {}", hash_encoding::base58_encode(&patch.tree_hp));
+    if let Some(parent) = patch.parent_patch_hp {
+        println!("Parent: {}", hash_encoding::base58_encode(&parent));
+    }
     println!();
-    println!("Operations: {} changes", patch.operations.len());
+
+    // Show file changes count
+    if let Some(diffs) = &patch.file_diffs {
+        println!("File changes: {}", diffs.len());
+    } else {
+        println!("File changes: (initial patch - no diffs)");
+    }
 
     // TODO: Show summary of file changes
     // - Added files
@@ -335,11 +348,11 @@ fn cmd_snapshot(message: &str) -> Result<()> {
     }
 
     // Create fake build hash (in real implementation, this comes from cargo build output)
-    let build_hash = blake3::hash(b"test build");
+    let _build_hash = blake3::hash(b"test build");
 
     println!("Creating patch...");
 
-    let patch_id = snapshot::create_snapshot(&cairn_dir, message.to_string(), build_hash)
+    let patch_id = snapshot::create_snapshot(&cairn_dir, message.to_string())
         .context("Failed to create patch")?;
 
     let mnemonic = mnemonic::patch_id_to_mnemonic(&patch_id, 5)
