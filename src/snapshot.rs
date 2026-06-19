@@ -420,13 +420,33 @@ fn extract_files_recursive(
     }
 
     // This is a directory section - recurse into subdirectories and files
-    for subsection in &section.subsections {
-        let subsection_name = denormalize_name(&subsection.name);
-        let subsection_path = current_path.join(subsection_name);
-        extract_files_recursive(subsection, &subsection_path, files)?;
+    // Note: With nested fields, we need to look for nested field values
+    for field in &section.fields {
+        for value in &field.values {
+            if let vsf::VsfType::f(nested_field_box) = value {
+                let nested_section = field_to_section(nested_field_box.as_ref());
+                let subsection_name = denormalize_name(&nested_section.name);
+                let subsection_path = current_path.join(subsection_name);
+                extract_files_recursive(&nested_section, &subsection_path, files)?;
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Convert a VsfField to a VsfSection (for compatibility with old code)
+fn field_to_section(field: &vsf::VsfField) -> vsf::file_format::VsfSection {
+    let mut section = vsf::file_format::VsfSection::new(&field.name);
+
+    // Convert each value in the field to a section field
+    // For nested fields, this preserves the structure
+    for (i, value) in field.values.iter().enumerate() {
+        let field_name = format!("value_{}", i);
+        section.add_field(field_name, value.clone());
+    }
+
+    section
 }
 
 /// Denormalize a VSF-compliant name back to original form

@@ -233,15 +233,18 @@ impl Default for RepositoryState {
 
 /// Extract BLAKE3 hash from VsfType
 fn extract_hash(value: &VsfType) -> Option<Blake3Hash> {
-    value.as_bytes().and_then(|bytes| {
-        if bytes.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(bytes);
-            Some(arr)
-        } else {
-            None
+    match value {
+        VsfType::hp(bytes) | VsfType::hb(bytes) => {
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(bytes);
+                Some(arr)
+            } else {
+                None
+            }
         }
-    })
+        _ => None,
+    }
 }
 
 #[cfg(test)]

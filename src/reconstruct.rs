@@ -116,7 +116,7 @@ pub fn apply_diff_forward(base_content: &[u8], operations: &[ByteOp]) -> Result<
 
 /// Reconstruct a file at a specific patch
 ///
-/// Walks back through patch chain, loading blobs and applying diffs
+/// Walks back thru patch chain, loading blobs and applying diffs
 /// until reaching the file's content at the target patch.
 ///
 /// # Arguments

@@ -30,7 +30,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "cairn")]
-#[command(about = "Patch-based version control for successful cargo builds with eggs")]
+#[command(about = "Patch-based version control for successful cargo builds and things with tacos")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]

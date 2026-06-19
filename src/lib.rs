@@ -1,4 +1,5 @@
 //! Cairn - Patch-based version control for successful cargo builds
+//! Now with true nested field support in VSF!
 
 pub mod blob;
 pub mod daemon;

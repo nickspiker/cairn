@@ -91,6 +91,21 @@ pub struct Patch {
     pub file_diffs: Option<HashMap<PathBuf, FileDiff>>,
 }
 
+/// Convert a VsfSection to a VsfField (for nested field representation)
+///
+/// Takes a section and converts all its fields into a VsfField where each
+/// original field becomes a nested value.
+fn section_to_field(section: VsfSection) -> vsf::VsfField {
+    let mut values = Vec::new();
+
+    for field in section.fields {
+        // Each field in the section becomes a nested field value
+        values.push(VsfType::f(Box::new(field)));
+    }
+
+    vsf::VsfField::with_values(section.name, values)
+}
+
 /// Create a patch from metadata
 ///
 /// Returns the patch's provenance hash (hp), which is computed from ONLY
@@ -139,47 +154,65 @@ pub fn create_patch(info: PatchInfo) -> Result<Blake3Hash> {
         let mut parent_section = VsfSection::new("parent");
         parent_section.add_field("patch", VsfType::hp(parent_hp.to_vec()));
 
-        // Add diffs section with VSF-encoded operations
+        // Add diffs as a multi-value field with nested file diffs
         if let Some(ref diffs) = info.file_diffs {
-            let mut diffs_section = VsfSection::new("diffs");
-
             // Sort entries by path for deterministic hash computation
             let mut sorted_diffs: Vec<_> = diffs.iter().collect();
             sorted_diffs.sort_by_key(|(path, _)| path.as_os_str());
 
+            let mut file_diff_fields = Vec::new();
+
             for (path, diff) in sorted_diffs {
                 // Convert path to hex-encoded label (f_{hex})
                 let path_label = path_to_hex_label(path)?;
-                let mut file_diff_section = VsfSection::new(&path_label);
 
-                // Strategy field (0=diff, 1=new_blob)
-                file_diff_section.add_field("strategy", VsfType::u3(diff.strategy as u8));
-                file_diff_section.add_field("old_blob", VsfType::hb(diff.old_blob.to_vec()));
-                file_diff_section.add_field("new_blob", VsfType::hb(diff.new_blob.to_vec()));
+                // Build file diff as nested fields
+                let mut file_values = Vec::new();
 
-                // Encode operations as nested VSF sections
-                let mut ops_section = VsfSection::new("ops");
+                // Add strategy, old_blob, new_blob as nested fields
+                file_values.push(VsfType::f(Box::new(
+                    vsf::VsfField::with_values("strategy", vec![VsfType::u3(diff.strategy as u8)])
+                )));
+                file_values.push(VsfType::f(Box::new(
+                    vsf::VsfField::with_values("old_blob", vec![VsfType::hb(diff.old_blob.to_vec())])
+                )));
+                file_values.push(VsfType::f(Box::new(
+                    vsf::VsfField::with_values("new_blob", vec![VsfType::hb(diff.new_blob.to_vec())])
+                )));
+
+                // Build ops as nested fields
+                let mut op_fields = Vec::new();
                 for op in &diff.ops {
                     match op {
                         ByteOp::Copy { start, len } => {
-                            let mut copy_section = VsfSection::new("copy");
-                            copy_section.add_field("start", VsfType::u(*start, false));
-                            copy_section.add_field("len", VsfType::u(*len, false));
-                            ops_section.add_subsection(copy_section);
+                            let copy_field = vsf::VsfField::with_values(
+                                "copy",
+                                vec![VsfType::u(*start, false), VsfType::u(*len, false)]
+                            );
+                            op_fields.push(VsfType::f(Box::new(copy_field)));
                         }
                         ByteOp::Insert { content } => {
-                            let mut insert_section = VsfSection::new("insert");
-                            insert_section.add_field("data", VsfType::v('b' as u8, content.clone()));
-                            ops_section.add_subsection(insert_section);
+                            let insert_field = vsf::VsfField::with_values(
+                                "insert",
+                                vec![VsfType::v('b' as u8, content.clone())]
+                            );
+                            op_fields.push(VsfType::f(Box::new(insert_field)));
                         }
                     }
                 }
-                file_diff_section.add_subsection(ops_section);
 
-                diffs_section.add_subsection(file_diff_section);
+                // Add ops field containing operation nested fields
+                file_values.push(VsfType::f(Box::new(
+                    vsf::VsfField::with_values("ops", op_fields)
+                )));
+
+                // Create the file diff field with all values
+                let file_diff_field = vsf::VsfField::with_values(&path_label, file_values);
+                file_diff_fields.push(VsfType::f(Box::new(file_diff_field)));
             }
 
-            parent_section.add_subsection(diffs_section);
+            // Add diffs field with all file diff nested fields
+            parent_section.add_field_multi("diffs", file_diff_fields);
         }
 
         builder = builder.add_section_direct(parent_section);
@@ -260,104 +293,133 @@ pub fn load_patch(cairn_dir: &Path, hp: &Blake3Hash) -> Result<Patch> {
                     }
                 }
 
-                // Extract diffs subsection
-                if let Some(diffs_subsection) = section.get_subsection("diffs") {
-                    let mut diffs_map = std::collections::HashMap::new();
+                // Extract diffs field (now contains nested fields, not subsections)
+                if let Some(diffs_field) = section.get_field("diffs") {
+                    if let Some(VsfType::f(diffs_nested)) = diffs_field.values.first() {
+                        let mut diffs_map = std::collections::HashMap::new();
 
-                    // Iterate through file diff subsections
-                    for file_subsection in &diffs_subsection.subsections {
-                        // Decode hex path name (format: "f_7372632f6d61696e2e7273")
-                        let hex_label = &file_subsection.name;
-                        if !hex_label.starts_with("f_") {
-                            continue; // Skip non-file subsections
-                        }
-
-                        let path = match hex_label_to_path(hex_label) {
-                            Ok(p) => p,
-                            Err(_) => continue, // Skip invalid paths
-                        };
-
-                        // Extract strategy
-                        let strategy = if let Some(field) = file_subsection.get_field("strategy") {
-                            if let Some(VsfType::u(val, _)) = field.values.first() {
-                                match *val {
-                                    0 => DiffStrategy::Diff,
-                                    1 => DiffStrategy::NewBlob,
-                                    _ => DiffStrategy::Diff,
+                        // Iterate thru file diff nested fields
+                        for file_value in &diffs_nested.values {
+                            if let VsfType::f(file_nested) = file_value {
+                                // Decode hex path name (format: "f_7372632f6d61696e2e7273")
+                                let hex_label = &file_nested.name;
+                                if !hex_label.starts_with("f_") {
+                                    continue; // Skip non-file fields
                                 }
-                            } else {
-                                DiffStrategy::Diff
-                            }
-                        } else {
-                            DiffStrategy::Diff
-                        };
 
-                        // Extract old_blob hash
-                        let mut old_blob = [0u8; 32];
-                        if let Some(field) = file_subsection.get_field("old_blob") {
-                            if let Some(VsfType::hb(hash_vec)) = field.values.first() {
-                                if hash_vec.len() == 32 {
-                                    old_blob.copy_from_slice(hash_vec);
-                                }
-                            }
-                        }
+                                let path = match hex_label_to_path(hex_label) {
+                                    Ok(p) => p,
+                                    Err(_) => continue, // Skip invalid paths
+                                };
 
-                        // Extract new_blob hash
-                        let mut new_blob = [0u8; 32];
-                        if let Some(field) = file_subsection.get_field("new_blob") {
-                            if let Some(VsfType::hb(hash_vec)) = field.values.first() {
-                                if hash_vec.len() == 32 {
-                                    new_blob.copy_from_slice(hash_vec);
-                                }
-                            }
-                        }
+                                // Helper to find a nested field value by name
+                                let find_field = |name: &str| -> Option<&VsfType> {
+                                    file_nested.values.iter()
+                                        .find_map(|v| {
+                                            if let VsfType::f(field) = v {
+                                                if field.name == name {
+                                                    field.values.first()
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                };
 
-                        // Extract ops subsection
-                        let mut ops = Vec::new();
-                        if let Some(ops_subsection) = file_subsection.get_subsection("ops") {
-                            for op_subsection in &ops_subsection.subsections {
-                                match op_subsection.name.as_str() {
-                                    "copy" => {
-                                        let start = op_subsection
-                                            .get_field("start")
-                                            .and_then(|f| f.values.first())
-                                            .and_then(|v| v.as_usize())
-                                            .unwrap_or(0);
-
-                                        let len = op_subsection
-                                            .get_field("len")
-                                            .and_then(|f| f.values.first())
-                                            .and_then(|v| v.as_usize())
-                                            .unwrap_or(0);
-
-                                        ops.push(crate::patch::ByteOp::Copy { start, len });
+                                // Extract strategy
+                                let strategy = if let Some(VsfType::u3(val)) = find_field("strategy") {
+                                    match val {
+                                        0 => DiffStrategy::Diff,
+                                        1 => DiffStrategy::NewBlob,
+                                        _ => DiffStrategy::Diff,
                                     }
-                                    "insert" => {
-                                        let content = op_subsection
-                                            .get_field("content")
-                                            .and_then(|f| f.values.first())
-                                            .and_then(|v| v.as_bytes())
-                                            .map(|b| b.to_vec())
-                                            .unwrap_or_else(Vec::new);
+                                } else {
+                                    DiffStrategy::Diff
+                                };
 
-                                        ops.push(crate::patch::ByteOp::Insert { content });
+                                // Extract old_blob hash
+                                let mut old_blob = [0u8; 32];
+                                if let Some(VsfType::hb(hash_vec)) = find_field("old_blob") {
+                                    if hash_vec.len() == 32 {
+                                        old_blob.copy_from_slice(hash_vec.as_slice());
                                     }
-                                    _ => {} // Unknown op type
                                 }
+
+                                // Extract new_blob hash
+                                let mut new_blob = [0u8; 32];
+                                if let Some(VsfType::hb(hash_vec)) = find_field("new_blob") {
+                                    if hash_vec.len() == 32 {
+                                        new_blob.copy_from_slice(hash_vec.as_slice());
+                                    }
+                                }
+
+                                // Extract ops field (contains nested field values for operations)
+                                let mut ops = Vec::new();
+                                if let Some(ops_nested) = file_nested.values.iter().find_map(|v| {
+                                    if let VsfType::f(field) = v {
+                                        if field.name == "ops" {
+                                            Some(field.as_ref())
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                }) {
+                                    // Each value in ops_nested.values is a nested field for an operation
+                                    for op_value in &ops_nested.values {
+                                        if let VsfType::f(op_field) = op_value {
+                                            match op_field.name.as_str() {
+                                                "copy" => {
+                                                    // Copy operation has two values: start and len
+                                                    let start = op_field.values.get(0)
+                                                        .and_then(|v| match v {
+                                                            VsfType::u(val, _) => Some(*val),
+                                                            _ => None,
+                                                        })
+                                                        .unwrap_or(0);
+
+                                                    let len = op_field.values.get(1)
+                                                        .and_then(|v| match v {
+                                                            VsfType::u(val, _) => Some(*val),
+                                                            _ => None,
+                                                        })
+                                                        .unwrap_or(0);
+
+                                                    ops.push(crate::patch::ByteOp::Copy { start, len });
+                                                }
+                                                "insert" => {
+                                                    // Insert operation has one value: wrapped data
+                                                    let content = op_field.values.first()
+                                                        .and_then(|v| match v {
+                                                            VsfType::v(_, data) => Some(data.clone()),
+                                                            _ => None,
+                                                        })
+                                                        .unwrap_or_else(Vec::new);
+
+                                                    ops.push(crate::patch::ByteOp::Insert { content });
+                                                }
+                                                _ => {} // Unknown op type
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Create FileDiff and add to map
+                                let file_diff = FileDiff {
+                                    strategy,
+                                    old_blob,
+                                    new_blob,
+                                    ops,
+                                };
+                                diffs_map.insert(path, file_diff);
                             }
                         }
 
-                        // Create FileDiff and add to map
-                        let file_diff = FileDiff {
-                            strategy,
-                            old_blob,
-                            new_blob,
-                            ops,
-                        };
-                        diffs_map.insert(path, file_diff);
+                        file_diffs = Some(diffs_map);
                     }
-
-                    file_diffs = Some(diffs_map);
                 }
             }
             _ => {

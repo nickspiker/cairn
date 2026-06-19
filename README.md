@@ -256,7 +256,7 @@ MIT or Apache-2.0, your choice.
 
 ## Author
 
-**Nick Spiker** - Building correct tools from first principles.
+**Nick Spiker** - Distilling tools down to the correct thing that was always underneath.
 
 ---
 
