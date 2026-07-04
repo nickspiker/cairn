@@ -79,7 +79,7 @@ class CairnTreeProvider implements vscode.TreeDataProvider<CairnTreeItem> {
                 }),
             ];
         } else if (element.contextValue === 'patches') {
-            // List patches from .cairn/patches directory
+            // List patches via the cairn CLI (storage lives inside the vault now)
             outputChannel.appendLine('[PATCHES] Loading patches list');
             return this.getPatches();
         }
@@ -122,54 +122,50 @@ class CairnTreeProvider implements vscode.TreeDataProvider<CairnTreeItem> {
         }
 
         const workspaceRoot = workspaceFolders[0].uri.fsPath;
-        const patchesDir = path.join(workspaceRoot, '.cairn', 'patches');
-        outputChannel.appendLine(`[PATCHES] Reading from: ${patchesDir}`);
-
-        if (!fs.existsSync(patchesDir)) {
-            outputChannel.appendLine('[PATCHES] Directory does not exist');
-            return [new CairnTreeItem('No patches yet', vscode.TreeItemCollapsibleState.None)];
+        const cairnBinary = findCairnBinary();
+        if (!cairnBinary) {
+            outputChannel.appendLine('[PATCHES] cairn binary not found');
+            return [new CairnTreeItem('cairn binary not found', vscode.TreeItemCollapsibleState.None)];
         }
 
-        // Get current patch hash
-        const currentPatchHash = this.getCurrentPatchHash(workspaceRoot);
-
         try {
-            const files = fs.readdirSync(patchesDir, { withFileTypes: true });
-            outputChannel.appendLine(`[PATCHES] Found ${files.length} files`);
+            // All storage lives inside .cairn/vault; the CLI is the only reader.
+            const result = require('child_process').spawnSync(cairnBinary, ['patches'], {
+                cwd: workspaceRoot,
+                encoding: 'utf8'
+            });
 
-            const patches = files
-                .filter(dirent => dirent.isFile() && dirent.name.endsWith('.vsf'))
-                .map(dirent => {
-                    const filePath = path.join(patchesDir, dirent.name);
-                    const stats = fs.statSync(filePath);
-                    return {
-                        name: dirent.name.replace('.vsf', ''),
-                        mtime: stats.mtime
-                    };
-                })
-                .sort((a, b) => b.mtime.getTime() - a.mtime.getTime()) // Most recent first
-                .map(patch => {
-                    const shortHash = patch.name.substring(0, 8);
-                    const timeStr = patch.mtime.toLocaleString();
-                    const isCurrent = currentPatchHash === patch.name;
-                    const icon = isCurrent ? '⚪' : '⚫';
-                    const label = isCurrent
-                        ? `${icon} ${shortHash} (${timeStr}) [CURRENT]`
-                        : `${icon} ${shortHash} (${timeStr})`;
-                    return new CairnTreeItem(
-                        label,
-                        vscode.TreeItemCollapsibleState.None,
-                        {
-                            command: 'cairn.jumpPatch',
-                            title: 'Switch to Patch',
-                            arguments: [patch.name]
-                        },
-                        'patch'
-                    );
-                });
+            if (result.status !== 0 || !result.stdout) {
+                outputChannel.appendLine(`[PATCHES] cairn patches failed: ${result.stderr || result.status}`);
+                return [new CairnTreeItem('No patches yet', vscode.TreeItemCollapsibleState.None)];
+            }
 
-            outputChannel.appendLine(`[PATCHES] Returning ${patches.length} patch items`);
-            return patches.length > 0 ? patches : [new CairnTreeItem('No patches yet', vscode.TreeItemCollapsibleState.None)];
+            const patches: { id: string; mnemonic: string; current: boolean }[] =
+                JSON.parse(result.stdout.trim());
+            outputChannel.appendLine(`[PATCHES] Found ${patches.length} patches`);
+
+            if (patches.length === 0) {
+                return [new CairnTreeItem('No patches yet', vscode.TreeItemCollapsibleState.None)];
+            }
+
+            return patches.map(patch => {
+                const icon = patch.current ? '⚪' : '⚫';
+                const label = patch.current
+                    ? `${icon} ${patch.mnemonic} [CURRENT]`
+                    : `${icon} ${patch.mnemonic}`;
+                const item = new CairnTreeItem(
+                    label,
+                    vscode.TreeItemCollapsibleState.None,
+                    {
+                        command: 'cairn.jumpPatch',
+                        title: 'Switch to Patch',
+                        arguments: [patch.id]
+                    },
+                    'patch'
+                );
+                item.tooltip = `${patch.mnemonic}\n${patch.id}`;
+                return item;
+            });
         } catch (err) {
             outputChannel.appendLine(`[PATCHES] Error: ${err}`);
             return [new CairnTreeItem('Error reading patches', vscode.TreeItemCollapsibleState.None)];

@@ -70,6 +70,10 @@ enum Commands {
     #[command(hide = true)]
     Current,
 
+    /// Print the patch list as JSON (for tooling: id, mnemonic, current), newest first
+    #[command(hide = true)]
+    Patches,
+
     /// Create a patch manually (for testing)
     #[command(hide = true)]
     Snapshot {
@@ -103,6 +107,9 @@ fn main() -> Result<()> {
         }
         Commands::Current => {
             cmd_current()?;
+        }
+        Commands::Patches => {
+            cmd_patches()?;
         }
         Commands::Snapshot { message } => {
             cmd_snapshot(&message)?;
@@ -343,6 +350,34 @@ fn cmd_current() -> Result<()> {
 
     // Output just the patch ID (for tooling)
     println!("{}", repo_state.head);
+    Ok(())
+}
+
+fn cmd_patches() -> Result<()> {
+    let cairn_dir = PathBuf::from(".cairn");
+    if !cairn_dir.join("vault").exists() {
+        println!("[]");
+        return Ok(());
+    }
+    let mut vault = vault::CairnVault::open_existing(&cairn_dir)?;
+    let repo_state =
+        state::RepositoryState::load(&mut vault).context("Failed to load repository state")?;
+
+    let patches: Vec<serde_json::Value> = repo_state
+        .patches
+        .iter()
+        .rev() // newest first
+        .map(|id| {
+            let mnemonic = mnemonic::patch_id_to_mnemonic(id, 5)
+                .unwrap_or_else(|_| id.chars().take(16).collect());
+            serde_json::json!({
+                "id": id,
+                "mnemonic": mnemonic,
+                "current": *id == repo_state.head,
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string(&patches)?);
     Ok(())
 }
 
