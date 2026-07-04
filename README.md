@@ -211,6 +211,12 @@ Cairn complements Git—use both:
 - **Git** for commits, branches, collaboration
 - **Cairn** for build-gated local snapshots
 
+Cairn never touches `.git/`, and jump can only ever write inside the tracked
+paths — so `git restore .` is always a complete undo of anything cairn does
+to the working tree. On first init inside a git repo, cairn adds `.cairn/`
+to your `.gitignore` (announced, idempotent, skipped if already covered) so
+the vault never ends up in a commit.
+
 Cairn doesn't replace Git. It solves a different problem: "give me the last state that compiled."
 
 ```bash

@@ -405,5 +405,46 @@ fn auto_init(cairn_dir: &Path) -> Result<()> {
         .save(&mut vault)
         .context("Failed to save initial state")?;
 
+    // Keep the vault out of git — same etiquette as `cargo new`. Best-effort: never
+    // fail a build over gitignore hygiene.
+    ensure_gitignored();
+
     Ok(())
+}
+
+/// Append `.cairn/` to the project .gitignore at init time, when a git repo exists and
+/// nothing already ignores it. git itself is the authority on "already ignored" (any
+/// pattern, any level, global config included); appends preserve the file byte-for-byte
+/// plus at most a missing trailing newline. Announced when it happens — the resulting
+/// one-line diff should explain itself.
+fn ensure_gitignored() {
+    if !Path::new(".git").exists() {
+        return;
+    }
+    match Command::new("git")
+        .args(["check-ignore", "-q", ".cairn"])
+        .status()
+    {
+        Ok(status) if status.success() => return, // already covered by some pattern
+        Ok(_) => {}
+        Err(_) => {
+            // git binary unavailable — fall back to a plain scan of the file itself.
+            if let Ok(content) = std::fs::read_to_string(".gitignore") {
+                let covered = content.lines().any(|l| {
+                    matches!(l.trim(), ".cairn" | ".cairn/" | "/.cairn" | "/.cairn/")
+                });
+                if covered {
+                    return;
+                }
+            }
+        }
+    }
+    let mut content = std::fs::read_to_string(".gitignore").unwrap_or_default();
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(".cairn/\n");
+    if std::fs::write(".gitignore", content).is_ok() {
+        println!("✓ Cairn: Added .cairn/ to .gitignore");
+    }
 }
