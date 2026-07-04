@@ -32,6 +32,7 @@ path = "src/bin/cargo-cairn.rs"
 
 [dependencies]
 vsf = { path = "../vsf", features = ["text", "crypto"] }
+manifestus = { path = "../manifestus" }
 blake3 = "1.5"
 chrono = "0.4"
 anyhow = "1.0"

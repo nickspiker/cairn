@@ -18,10 +18,10 @@ mod patch;
 mod patch_storage;
 mod reconstruct;
 mod snapshot;
-mod snapshot_vsf;
 mod state;
 mod suffix_array;
 mod tree;
+mod vault;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -123,8 +123,9 @@ fn cmd_list() -> Result<()> {
     }
 
     // Load repository state
+    let mut vault = vault::CairnVault::open_existing(&cairn_dir)?;
     let repo_state =
-        state::RepositoryState::load(&cairn_dir).context("Failed to load repository state")?;
+        state::RepositoryState::load(&mut vault).context("Failed to load repository state")?;
 
     if repo_state.is_empty() {
         println!("No patches yet - build your project to create the first one");
@@ -170,8 +171,9 @@ fn cmd_show(patch_id: &str) -> Result<()> {
     }
 
     // Load repository state
+    let mut vault = vault::CairnVault::open_existing(&cairn_dir)?;
     let repo_state =
-        state::RepositoryState::load(&cairn_dir).context("Failed to load repository state")?;
+        state::RepositoryState::load(&mut vault).context("Failed to load repository state")?;
 
     // Find patch by prefix match (supports both mnemonic and base64url)
     let full_patch_id = find_patch_by_id(&repo_state.patches, patch_id)?;
@@ -185,7 +187,7 @@ fn cmd_show(patch_id: &str) -> Result<()> {
     patch_hp.copy_from_slice(&patch_bytes);
 
     // Load the patch using new system
-    let patch = patch_storage::load_patch(&cairn_dir, &patch_hp)
+    let patch = patch_storage::load_patch(&mut vault, &patch_hp)
         .context("Failed to load patch")?;
 
     // Display patch information with mnemonic
@@ -226,8 +228,9 @@ fn cmd_rollback(patch_id: &str) -> Result<()> {
     }
 
     // Load repository state
+    let mut vault = vault::CairnVault::open_existing(&cairn_dir)?;
     let repo_state =
-        state::RepositoryState::load(&cairn_dir).context("Failed to load repository state")?;
+        state::RepositoryState::load(&mut vault).context("Failed to load repository state")?;
 
     // Find patch by prefix match (supports both mnemonic and base64url)
     let target_patch_id = find_patch_by_id(&repo_state.patches, patch_id)?;
@@ -258,15 +261,20 @@ fn cmd_jump(patch_id: &str) -> Result<()> {
         ));
     }
 
-    // Load repository state
-    let repo_state =
-        state::RepositoryState::load(&cairn_dir).context("Failed to load repository state")?;
+    // Load repository state (handle dropped before jump re-opens the vault - the lock is exclusive)
+    let (target_patch_id, at_target) = {
+        let mut vault = vault::CairnVault::open_existing(&cairn_dir)?;
+        let repo_state =
+            state::RepositoryState::load(&mut vault).context("Failed to load repository state")?;
 
-    // Find patch by prefix match (supports both mnemonic and base64url)
-    let target_patch_id = find_patch_by_id(&repo_state.patches, patch_id)?;
+        // Find patch by prefix match (supports both mnemonic and base64url)
+        let target_patch_id = find_patch_by_id(&repo_state.patches, patch_id)?;
+        let at_target = target_patch_id == repo_state.head;
+        (target_patch_id, at_target)
+    };
 
     // Check if already at this patch
-    if target_patch_id == repo_state.head {
+    if at_target {
         let mnemonic = mnemonic::patch_id_to_mnemonic(&target_patch_id, 5)
             .unwrap_or_else(|_| format!("{}...", &target_patch_id[..16]));
         println!("Already at patch {}", mnemonic);
@@ -325,8 +333,9 @@ fn cmd_current() -> Result<()> {
     }
 
     // Load repository state
+    let mut vault = vault::CairnVault::open_existing(&cairn_dir)?;
     let repo_state =
-        state::RepositoryState::load(&cairn_dir).context("Failed to load repository state")?;
+        state::RepositoryState::load(&mut vault).context("Failed to load repository state")?;
 
     if repo_state.head.is_empty() {
         return Err(anyhow!("No current patch - repository is empty"));
@@ -352,7 +361,8 @@ fn cmd_snapshot(message: &str) -> Result<()> {
 
     println!("Creating patch...");
 
-    let patch_id = snapshot::create_snapshot(&cairn_dir, message.to_string())
+    let mut vault = vault::CairnVault::open(&cairn_dir)?;
+    let patch_id = snapshot::create_snapshot(&mut vault, message.to_string())
         .context("Failed to create patch")?;
 
     let mnemonic = mnemonic::patch_id_to_mnemonic(&patch_id, 5)

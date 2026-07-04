@@ -13,8 +13,8 @@ pub mod patch;
 pub mod patch_storage;
 pub mod reconstruct;
 pub mod snapshot;
-pub mod snapshot_vsf;
 pub mod state;
 pub mod suffix_array;
 pub mod tree;
+pub mod vault;
 // Testing byte-level diffs

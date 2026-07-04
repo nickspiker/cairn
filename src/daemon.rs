@@ -282,28 +282,19 @@ fn handle_list(req: &DaemonRequest) -> DaemonResponse {
         .map(|p| p.join(".cairn"))
         .unwrap_or_else(|| PathBuf::from(".cairn"));
 
-    let patches_dir = cairn_dir.join("patches");
-    if !patches_dir.exists() {
+    if !cairn_dir.join("vault").exists() {
         return DaemonResponse::success("No patches").with_data("[]");
     }
 
-    let mut patches = Vec::new();
-    match std::fs::read_dir(&patches_dir) {
-        Ok(entries) => {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if name.ends_with(".vsf") {
-                            patches.push(name.trim_end_matches(".vsf").to_string());
-                        }
-                    }
-                }
-            }
-        }
+    // Chronological patch list from the committed repository state.
+    let patches = match crate::vault::CairnVault::open_existing(&cairn_dir)
+        .and_then(|mut v| crate::state::RepositoryState::load(&mut v))
+    {
+        Ok(state) => state.patches,
         Err(e) => {
             return DaemonResponse::error(format!("Failed to list patches: {}", e));
         }
-    }
+    };
 
     match serde_json::to_string(&patches) {
         Ok(json) => DaemonResponse::success(format!("Found {} patches", patches.len())).with_data(json),

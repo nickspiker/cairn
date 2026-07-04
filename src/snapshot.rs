@@ -9,8 +9,7 @@
 use crate::blob;
 use crate::hash_encoding::base58_encode;
 use crate::patch_storage::{PatchInfo, create_patch};
-use crate::state::RepositoryState;
-use crate::tree;
+use crate::vault::CairnVault;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
@@ -27,26 +26,26 @@ use std::path::PathBuf;
 /// 2. Create a tree mapping paths → blob hashes
 /// 3. Create a patch referencing the tree
 pub fn create_snapshot_from_files(
-    cairn_dir: &PathBuf,
+    vault: &mut CairnVault,
     message: String,
     current_files: HashMap<PathBuf, Vec<u8>>,
 ) -> Result<String> {
     // Load current repository state
     let mut repo_state =
-        RepositoryState::load(cairn_dir).context("Failed to load repository state")?;
+        crate::state::RepositoryState::load(vault).context("Failed to load repository state")?;
 
     // 1. Store all files as blobs and get their hashes
     println!("Storing {} files as blobs...", current_files.len());
     let mut file_to_blob = HashMap::new();
     for (path, content) in &current_files {
-        let blob_hash = blob::store_blob(content)
+        let blob_hash = blob::store_blob(vault, content)
             .with_context(|| format!("Failed to store blob for {:?}", path))?;
         file_to_blob.insert(path.clone(), blob_hash);
     }
 
     // 2. Create tree from file→blob mappings
     println!("Creating tree from {} file mappings...", file_to_blob.len());
-    let tree_hp = tree::create_tree(&file_to_blob)
+    let tree_hp = crate::tree::create_tree(vault, &file_to_blob)
         .context("Failed to create tree")?;
 
     // 3. Get parent commit hash (if exists)
@@ -66,7 +65,7 @@ pub fn create_snapshot_from_files(
 
     // 4. Check if there are any changes (compare tree hashes)
     if let Some(parent_hp) = parent_patch_hp {
-        let parent_patch = crate::patch_storage::load_patch(cairn_dir, &parent_hp)
+        let parent_patch = crate::patch_storage::load_patch(vault, &parent_hp)
             .context("Failed to load parent patch")?;
 
         if parent_patch.tree_hp == tree_hp {
@@ -84,7 +83,7 @@ pub fn create_snapshot_from_files(
         file_diffs: None,  // TODO: Compute diffs for space optimization
     };
 
-    let patch_hp = create_patch(patch_info)
+    let patch_hp = create_patch(vault, patch_info)
         .context("Failed to create patch")?;
 
     // 6. Encode patch hash as base58 for the patch ID
@@ -95,7 +94,7 @@ pub fn create_snapshot_from_files(
     println!("Updating repository state...");
     repo_state.add_patch(patch_id.clone(), tree_hp);
     repo_state
-        .save(cairn_dir)
+        .save(vault)
         .context("Failed to save repository state")?;
 
     Ok(patch_id)
@@ -109,9 +108,9 @@ pub fn create_snapshot_from_files(
 ///
 /// This is a legacy function that creates a complete snapshot.
 /// New code should use the incremental scan_working_directory + create_snapshot_from_files.
-pub fn create_snapshot(cairn_dir: &PathBuf, message: String) -> Result<String> {
+pub fn create_snapshot(vault: &mut CairnVault, message: String) -> Result<String> {
     // Load state
-    let state = crate::state::RepositoryState::load(cairn_dir)
+    let state = crate::state::RepositoryState::load(vault)
         .context("Failed to load repository state")?;
 
     // Scan for changes (no cache on initial snapshot)
@@ -123,7 +122,7 @@ pub fn create_snapshot(cairn_dir: &PathBuf, message: String) -> Result<String> {
     all_files.extend(scan_result.modified.clone());
 
     // Create snapshot from those files
-    create_snapshot_from_files(cairn_dir, message, all_files)
+    create_snapshot_from_files(vault, message, all_files)
 }
 
 /// Scan working directory for all files
@@ -329,143 +328,6 @@ fn scan_file(
     );
 
     Ok(())
-}
-
-/// Get the file tree from the previous patch
-pub fn get_previous_files(
-    repo_state: &RepositoryState,
-    cairn_dir: &PathBuf,
-) -> Result<HashMap<PathBuf, Vec<u8>>> {
-    if repo_state.is_empty() {
-        // No previous patch - return empty state
-        return Ok(HashMap::new());
-    }
-
-    // Get the snapshot hash from the latest patch in the repo state
-    let latest_snapshot_hash = &repo_state.latest_snapshot;
-
-    // Read all files from the snapshot VSF
-    read_all_files_from_snapshot(cairn_dir, latest_snapshot_hash)
-}
-
-/// Read all files from a snapshot VSF
-fn read_all_files_from_snapshot(
-    cairn_dir: &PathBuf,
-    snapshot_hash: &[u8; 32],
-) -> Result<HashMap<PathBuf, Vec<u8>>> {
-    let snapshot_path = cairn_dir
-        .join("snapshots")
-        .join(format!("{}.vsf", hex::encode(snapshot_hash)));
-
-    let bytes = fs::read(&snapshot_path).context(format!(
-        "Failed to load snapshot: {}",
-        hex::encode(snapshot_hash)
-    ))?;
-
-    // Parse VSF header
-    let (header, _) = vsf::VsfHeader::decode(&bytes)
-        .map_err(|e| anyhow::anyhow!("Failed to decode VSF header: {}", e))?;
-
-    // Find the "files" section
-    let files_field = header
-        .fields
-        .iter()
-        .find(|f| f.name == "files")
-        .context("Snapshot missing 'files' section")?;
-
-    // Parse the files section
-    let mut ptr = files_field.offset_bytes;
-    let files_section = vsf::file_format::VsfSection::parse(&bytes, &mut ptr)
-        .map_err(|e| anyhow::anyhow!("Failed to parse files section: {}", e))?;
-
-    // Recursively extract all files from the section tree
-    let mut files = HashMap::new();
-    extract_files_recursive(&files_section, &PathBuf::new(), &mut files)?;
-
-    Ok(files)
-}
-
-/// Recursively extract files from nested VSF sections
-fn extract_files_recursive(
-    section: &vsf::file_format::VsfSection,
-    current_path: &PathBuf,
-    files: &mut HashMap<PathBuf, Vec<u8>>,
-) -> Result<()> {
-    // Check if this section has a "content" field (it's a file)
-    if let Some(content_field) = section.get_field("content") {
-        if let Some(value) = content_field.values.first() {
-            let content = match value {
-                vsf::VsfType::x(text) => text.as_bytes().to_vec(),
-                vsf::VsfType::v(b'b', bytes) => bytes.clone(),
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "Unexpected content type in section: {:?}",
-                        section.name
-                    ));
-                }
-            };
-
-            // Denormalize just the filename (last component) since the directory path
-            // is already built up correctly in current_path
-            let denormalized_path = if let Some(parent) = current_path.parent() {
-                parent.join(denormalize_name(&section.name))
-            } else {
-                PathBuf::from(denormalize_name(&section.name))
-            };
-            files.insert(denormalized_path, content);
-        }
-
-        // File sections shouldn't have subsections - skip recursion to avoid path doubling
-        return Ok(());
-    }
-
-    // This is a directory section - recurse into subdirectories and files
-    // Note: With nested fields, we need to look for nested field values
-    for field in &section.fields {
-        for value in &field.values {
-            if let vsf::VsfType::f(nested_field_box) = value {
-                let nested_section = field_to_section(nested_field_box.as_ref());
-                let subsection_name = denormalize_name(&nested_section.name);
-                let subsection_path = current_path.join(subsection_name);
-                extract_files_recursive(&nested_section, &subsection_path, files)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Convert a VsfField to a VsfSection (for compatibility with old code)
-fn field_to_section(field: &vsf::VsfField) -> vsf::file_format::VsfSection {
-    let mut section = vsf::file_format::VsfSection::new(&field.name);
-
-    // Convert each value in the field to a section field
-    // For nested fields, this preserves the structure
-    for (i, value) in field.values.iter().enumerate() {
-        let field_name = format!("value_{}", i);
-        section.add_field(field_name, value.clone());
-    }
-
-    section
-}
-
-/// Denormalize a VSF-compliant name back to original form
-/// Reverses the normalize_name transformation
-fn denormalize_name(name: &str) -> String {
-    // Find the last underscore that separates base from extension
-    if let Some(last_underscore) = name.rfind('_') {
-        let (base, ext) = name.split_at(last_underscore);
-        // If the extension looks like a file extension (2-5 chars), restore the dot
-        let ext_part = &ext[1..]; // Skip the underscore
-        if ext_part.len() >= 2
-            && ext_part.len() <= 5
-            && ext_part.chars().all(|c| c.is_ascii_alphanumeric())
-        {
-            return format!("{}.{}", base, ext_part);
-        }
-    }
-    // No valid extension found, just return as-is
-    name.to_string()
 }
 
 #[cfg(test)]

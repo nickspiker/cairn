@@ -5,7 +5,6 @@
 //! and backward (child → parent) reconstruction.
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -27,7 +26,12 @@ pub struct WorkingMirror {
 impl WorkingMirror {
     /// Create a new working mirror in a temporary directory
     pub fn new() -> Result<Self> {
-        let mirror_dir = std::env::temp_dir().join(format!("cairn-mirror-{}", std::process::id()));
+        // Unique per instance, not just per process — concurrent mirrors (parallel tests,
+        // parallel reconstructions) must never share a directory or one Drop nukes the other.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mirror_dir =
+            std::env::temp_dir().join(format!("cairn-mirror-{}-{}", std::process::id(), n));
         fs::create_dir_all(&mirror_dir)
             .with_context(|| format!("Failed to create working mirror at {:?}", mirror_dir))?;
 
@@ -116,34 +120,23 @@ pub fn apply_diff_forward(base_content: &[u8], operations: &[ByteOp]) -> Result<
 
 /// Reconstruct a file at a specific patch
 ///
-/// Walks back thru patch chain, loading blobs and applying diffs
-/// until reaching the file's content at the target patch.
-///
-/// # Arguments
-/// * `cairn_dir` - Path to .cairn directory
-/// * `patch_hp` - Provenance hash of target patch
-/// * `file_path` - Path of file to reconstruct
-///
-/// # Returns
-/// * Reconstructed file content
-///
 /// # Process
 /// 1. Load patch and get tree
 /// 2. Get blob hash for file from tree
 /// 3. If file has parent diff, reconstruct from parent
 /// 4. Otherwise load blob directly
 pub fn reconstruct_file_at_patch(
-    cairn_dir: &Path,
+    vault: &mut crate::vault::CairnVault,
     patch_hp: &Blake3Hash,
     file_path: &Path,
 ) -> Result<Vec<u8>> {
     // Load the patch
-    let patch = load_patch(cairn_dir, patch_hp)
-        .with_context(|| format!("Failed to load patch for reconstruction"))?;
+    let patch = load_patch(vault, patch_hp)
+        .context("Failed to load patch for reconstruction")?;
 
     // Load the tree to get file→blob mapping
-    let tree = load_tree(cairn_dir, &patch.tree_hp)
-        .with_context(|| format!("Failed to load tree for reconstruction"))?;
+    let tree = load_tree(vault, &patch.tree_hp)
+        .context("Failed to load tree for reconstruction")?;
 
     // Get blob hash for this file
     let blob_hash = tree.get(file_path)
@@ -151,7 +144,7 @@ pub fn reconstruct_file_at_patch(
 
     // For now, just load the blob directly (no diff application yet)
     // TODO: Implement diff-based reconstruction when parent diffs are stored
-    let content = load_blob(cairn_dir, blob_hash)
+    let content = load_blob(vault, blob_hash)
         .with_context(|| format!("Failed to load blob for file {:?}", file_path))?;
 
     Ok(content)

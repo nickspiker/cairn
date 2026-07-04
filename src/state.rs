@@ -73,19 +73,19 @@ impl RepositoryState {
     pub fn encode_vsf(&self) -> Result<Vec<u8>> {
         // 1. Metadata section
         let mut metadata_section = VsfSection::new("metadata");
-        metadata_section.add_field("current", VsfType::l(self.head.clone()));
+        metadata_section.add_field("current", VsfType::x(self.head.clone()));
         metadata_section.add_field("snapshot", VsfType::hp(self.latest_snapshot.to_vec()));
 
         // 2. Patches section (insertion order)
         let mut patches_section = VsfSection::new("patches");
         for (idx, patch_id) in self.patches.iter().enumerate() {
-            patches_section.add_field(&format!("p{}", idx), VsfType::l(patch_id.clone()));
+            patches_section.add_field(&format!("p{}", idx), VsfType::x(patch_id.clone()));
         }
 
         // 3. Tracked paths section
         let mut tracked_section = VsfSection::new("tracked");
         for (idx, path) in self.tracked_paths.iter().enumerate() {
-            tracked_section.add_field(&format!("t{}", idx), VsfType::l(path.to_string_lossy().to_string()));
+            tracked_section.add_field(&format!("t{}", idx), VsfType::x(path.to_string_lossy().to_string()));
         }
 
         // Build VSF file (no files cache section - kept in memory only)
@@ -125,11 +125,12 @@ impl RepositoryState {
             let section = vsf::VsfSection::parse(bytes, &mut ptr)
                 .map_err(|e| anyhow!("Failed to parse section '{}': {}", field.name, e))?;
 
-            match section.name.as_str() {
+            // Sections under 1MB carry no embedded name; the header field is the authority.
+            match field.name.as_str() {
                 "metadata" => {
                     if let Some(field) = section.get_field("current") {
-                        if let Some(VsfType::l(s)) = field.values.first() {
-                            head = s.clone();
+                        if let Some(s) = field.values.first().and_then(|v| v.as_string()) {
+                            head = s.to_string();
                         }
                     }
                     if let Some(field) = section.get_field("snapshot") {
@@ -149,8 +150,8 @@ impl RepositoryState {
                     });
 
                     for field in patch_fields {
-                        if let Some(VsfType::l(patch_id)) = field.values.first() {
-                            patches.push(patch_id.clone());
+                        if let Some(patch_id) = field.values.first().and_then(|v| v.as_string()) {
+                            patches.push(patch_id.to_string());
                         }
                     }
                 }
@@ -165,7 +166,7 @@ impl RepositoryState {
                     });
 
                     for field in track_fields {
-                        if let Some(VsfType::l(path)) = field.values.first() {
+                        if let Some(path) = field.values.first().and_then(|v| v.as_string()) {
                             tracked_paths.push(PathBuf::from(path));
                         }
                     }
@@ -189,22 +190,19 @@ impl RepositoryState {
         })
     }
 
-    /// Save state to .cairn/state.vsf
-    pub fn save(&self, cairn_dir: &PathBuf) -> Result<()> {
-        let state_path = cairn_dir.join("state.vsf");
+    /// Save state to the vault (durable, commit-gated — a crash mid-save leaves the
+    /// previous committed state, never a torn file).
+    pub fn save(&self, vault: &mut crate::vault::CairnVault) -> Result<()> {
         let bytes = self.encode_vsf()?;
-        std::fs::write(&state_path, bytes)?;
-        Ok(())
+        vault.put(&crate::vault::state_key(), &bytes)
     }
 
-    /// Load state from .cairn/state.vsf
-    pub fn load(cairn_dir: &PathBuf) -> Result<Self> {
-        let state_path = cairn_dir.join("state.vsf");
-        if !state_path.exists() {
-            return Ok(Self::new());
+    /// Load state from the vault; a fresh repository starts empty.
+    pub fn load(vault: &mut crate::vault::CairnVault) -> Result<Self> {
+        match vault.get(&crate::vault::state_key())? {
+            Some(bytes) => Self::decode_vsf(&bytes),
+            None => Ok(Self::new()),
         }
-        let bytes = std::fs::read(&state_path)?;
-        Self::decode_vsf(&bytes)
     }
 
     /// Add a new patch to history

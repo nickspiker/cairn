@@ -5,8 +5,13 @@
 //! This wraps any cargo command and creates a cairn patch if it succeeds.
 //! The snapshot is taken BEFORE the build starts, ensuring it matches exactly
 //! what cargo compiled.
+//!
+//! The pending snapshot lives in the vault (not a scratch file); the vault handle -
+//! and with it the repository lock - is released while cargo runs, so builds never
+//! serialize against each other on cairn's account.
 
 use anyhow::{Context, Result};
+use cairn::vault::{CairnVault, pending_key};
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 
@@ -43,7 +48,7 @@ fn run() -> Result<()> {
     );
 
     // Auto-init if this is a build command and cairn isn't initialized
-    if is_build_command && !cairn_dir.exists() {
+    if is_build_command && !cairn_dir.join("vault").exists() {
         if let Err(e) = auto_init(&cairn_dir) {
             eprintln!("⚠️  Cairn: Failed to auto-initialize: {}", e);
             eprintln!("   Continuing with build anyway...");
@@ -53,11 +58,11 @@ fn run() -> Result<()> {
     }
 
     // Only snapshot for build-related commands
-    let should_snapshot = is_build_command && cairn_dir.exists();
+    let should_snapshot = is_build_command && cairn_dir.join("vault").exists();
 
     // If we should snapshot, take one BEFORE the build
     let snapshot_taken = if should_snapshot {
-        match create_pending_snapshot() {
+        match create_pending_snapshot(&cairn_dir) {
             Ok(true) => {
                 println!("📸 Cairn: Snapshotting current state...");
                 true
@@ -86,7 +91,7 @@ fn run() -> Result<()> {
 
     // If build succeeded and we took a snapshot, save it
     if status.success() && snapshot_taken {
-        if let Err(e) = save_pending_snapshot() {
+        if let Err(e) = save_pending_snapshot(&cairn_dir) {
             eprintln!("⚠️  Cairn: Failed to create patch: {}", e);
         } else {
             println!("✓ Cairn: Patch created");
@@ -94,7 +99,7 @@ fn run() -> Result<()> {
         }
     } else if snapshot_taken {
         // Build failed - discard the snapshot
-        let _ = discard_pending_snapshot();
+        let _ = discard_pending_snapshot(&cairn_dir);
     }
 
     exit(exit_code);
@@ -102,12 +107,11 @@ fn run() -> Result<()> {
 
 /// Create a pending snapshot (not yet committed)
 /// Returns Ok(true) if snapshot was created, Ok(false) if no changes
-fn create_pending_snapshot() -> Result<bool> {
-    let cairn_dir = PathBuf::from(".cairn");
-    let pending_file = cairn_dir.join(".pending");
+fn create_pending_snapshot(cairn_dir: &Path) -> Result<bool> {
+    let mut vault = CairnVault::open(cairn_dir)?;
 
     // Load state
-    let state = cairn::state::RepositoryState::load(&cairn_dir)
+    let state = cairn::state::RepositoryState::load(&mut vault)
         .context("Failed to load repository state")?;
 
     // Scan for changes (no persistent cache - recompute each time)
@@ -120,14 +124,15 @@ fn create_pending_snapshot() -> Result<bool> {
         || !scan_result.deleted.is_empty();
 
     if !has_changes {
-        // No changes
         return Ok(false);
     }
 
     // Store scan result for commit after successful build
     let pending_data =
         bincode::serialize(&scan_result).context("Failed to serialize pending snapshot")?;
-    std::fs::write(&pending_file, pending_data).context("Failed to write pending snapshot")?;
+    vault
+        .put(&pending_key(), &pending_data)
+        .context("Failed to store pending snapshot")?;
 
     Ok(true)
 }
@@ -172,21 +177,18 @@ fn scan_directory(dir: &Path, files: &mut std::collections::HashMap<PathBuf, Vec
 }
 
 /// Commit the pending snapshot as a real patch using Git-style architecture
-fn save_pending_snapshot() -> Result<()> {
-    let cairn_dir = PathBuf::from(".cairn");
-    let pending_file = cairn_dir.join(".pending");
-
-    if !pending_file.exists() {
-        return Ok(()); // Nothing to commit
-    }
+fn save_pending_snapshot(cairn_dir: &Path) -> Result<()> {
+    let mut vault = CairnVault::open(cairn_dir)?;
 
     // Read the pending scan result (used to detect if snapshot needed)
-    let pending_data = std::fs::read(&pending_file).context("Failed to read pending snapshot")?;
+    let Some(pending_data) = vault.get(&pending_key())? else {
+        return Ok(()); // Nothing to commit
+    };
     let _scan_result: cairn::snapshot::ScanResult =
         bincode::deserialize(&pending_data).context("Failed to deserialize pending snapshot")?;
 
     // Load current state to get parent commit (if exists)
-    let mut state = cairn::state::RepositoryState::load(&cairn_dir)
+    let mut state = cairn::state::RepositoryState::load(&mut vault)
         .context("Failed to load repository state")?;
 
     // Get parent patch hash (None for first patch)
@@ -208,9 +210,9 @@ fn save_pending_snapshot() -> Result<()> {
 
     // 1. Load parent tree if exists (needed for selective blob storage)
     let parent_tree = if let Some(parent_hp) = parent_patch_hp {
-        let parent_patch = cairn::patch_storage::load_patch(&cairn_dir, &parent_hp)
+        let parent_patch = cairn::patch_storage::load_patch(&mut vault, &parent_hp)
             .context("Failed to load parent patch")?;
-        Some(cairn::tree::load_tree(&cairn_dir, &parent_patch.tree_hp)
+        Some(cairn::tree::load_tree(&mut vault, &parent_patch.tree_hp)
             .context("Failed to load parent tree")?)
     } else {
         None
@@ -224,7 +226,6 @@ fn save_pending_snapshot() -> Result<()> {
     let mut file_diffs_data = std::collections::HashMap::new(); // Store diff info while building
 
     for (path, new_content) in all_files {
-
         if let Some(ref parent_tree_map) = parent_tree {
             if let Some(old_blob_hash) = parent_tree_map.get(&path) {
                 // Check if file actually changed by comparing content hashes
@@ -237,11 +238,11 @@ fn save_pending_snapshot() -> Result<()> {
                     // Don't add to file_diffs_data - unchanged files omitted from diffs
                 } else {
                     // File MODIFIED - create diff entry
-                    let old_content = cairn::blob::load_blob(&cairn_dir, old_blob_hash)
+                    let old_content = cairn::blob::load_blob(&mut vault, old_blob_hash)
                         .context("Failed to load old blob")?;
                     let diff_ops = cairn::diff::compute_byte_level_diff(&old_content, &new_content);
 
-                    let chain_size = compute_chain_size(&cairn_dir, &path,
+                    let chain_size = compute_chain_size(&mut vault, &path,
                         &parent_patch_hp.expect("parent_hp should exist here"))
                         .unwrap_or(0);
 
@@ -257,7 +258,7 @@ fn save_pending_snapshot() -> Result<()> {
                         ));
                     } else {
                         // Chain reset - store new blob
-                        let new_blob_hash = cairn::blob::store_blob(&new_content)
+                        let new_blob_hash = cairn::blob::store_blob(&mut vault, &new_content)
                             .context("Failed to store blob")?;
                         file_to_blob.insert(path.clone(), new_blob_hash);
 
@@ -271,7 +272,7 @@ fn save_pending_snapshot() -> Result<()> {
                 }
             } else {
                 // NEW file (not in parent) - store full blob as base
-                let new_blob_hash = cairn::blob::store_blob(&new_content)
+                let new_blob_hash = cairn::blob::store_blob(&mut vault, &new_content)
                     .context("Failed to store blob")?;
                 file_to_blob.insert(path.clone(), new_blob_hash);
 
@@ -284,15 +285,27 @@ fn save_pending_snapshot() -> Result<()> {
             }
         } else {
             // No parent - store all files as full blobs
-            let new_blob_hash = cairn::blob::store_blob(&new_content)
+            let new_blob_hash = cairn::blob::store_blob(&mut vault, &new_content)
                 .context("Failed to store blob")?;
             file_to_blob.insert(path.clone(), new_blob_hash);
         }
     }
 
     // 3. Create tree from blob references (virtual or real)
-    let tree_hp = cairn::tree::create_tree(&file_to_blob)
+    let tree_hp = cairn::tree::create_tree(&mut vault, &file_to_blob)
         .context("Failed to create tree")?;
+
+    // No content change since the parent → same tree → same patch ID. Don't append a
+    // duplicate history entry; just clear the pending marker.
+    if let Some(parent_hp) = parent_patch_hp {
+        let parent_patch = cairn::patch_storage::load_patch(&mut vault, &parent_hp)
+            .context("Failed to load parent patch")?;
+        if parent_patch.tree_hp == tree_hp {
+            vault.delete(&pending_key()).context("Failed to remove pending snapshot")?;
+            println!("  No changes since last patch - nothing to save");
+            return Ok(());
+        }
+    }
 
     // 4. Build file_diffs from collected data
     let file_diffs = if parent_patch_hp.is_some() {
@@ -321,7 +334,7 @@ fn save_pending_snapshot() -> Result<()> {
         file_diffs,
     };
 
-    let patch_hp = cairn::patch_storage::create_patch(patch_info)
+    let patch_hp = cairn::patch_storage::create_patch(&mut vault, patch_info)
         .context("Failed to create patch")?;
 
     // 4. Update state with new commit (use base58 encoding for consistency)
@@ -329,29 +342,24 @@ fn save_pending_snapshot() -> Result<()> {
 
     // For snapshot hash, use the tree's hp (directory structure snapshot)
     state.add_patch(patch_hash_str, tree_hp);
-    state.save(&cairn_dir).context("Failed to save state")?;
+    state.save(&mut vault).context("Failed to save state")?;
 
-    // Remove pending file
-    std::fs::remove_file(&pending_file).context("Failed to remove pending snapshot")?;
+    // Remove pending marker
+    vault.delete(&pending_key()).context("Failed to remove pending snapshot")?;
 
     Ok(())
 }
 
 /// Discard the pending snapshot
-fn discard_pending_snapshot() -> Result<()> {
-    let cairn_dir = PathBuf::from(".cairn");
-    let pending_file = cairn_dir.join(".pending");
-
-    if pending_file.exists() {
-        std::fs::remove_file(&pending_file).context("Failed to remove pending snapshot")?;
-    }
-
+fn discard_pending_snapshot(cairn_dir: &Path) -> Result<()> {
+    let mut vault = CairnVault::open_existing(cairn_dir)?;
+    vault.delete(&pending_key())?;
     Ok(())
 }
 
 /// Compute cumulative diff chain size for a file
 fn compute_chain_size(
-    cairn_dir: &Path,
+    vault: &mut CairnVault,
     file_path: &Path,
     parent_hp: &[u8; 32],
 ) -> Result<usize> {
@@ -359,7 +367,7 @@ fn compute_chain_size(
     let mut current_hp = Some(*parent_hp);
 
     while let Some(hp) = current_hp {
-        let patch = cairn::patch_storage::load_patch(cairn_dir, &hp)?;
+        let patch = cairn::patch_storage::load_patch(vault, &hp)?;
 
         if let Some(diffs) = &patch.file_diffs {
             if let Some(diff) = diffs.get(file_path) {
@@ -387,20 +395,14 @@ fn estimate_diff_size(ops: &[cairn::patch::ByteOp]) -> usize {
     }).sum()
 }
 
-/// Auto-initialize cairn repository with flat directory structure
-fn auto_init(cairn_dir: &PathBuf) -> Result<()> {
-    use std::fs;
+/// Auto-initialize the cairn repository: one vault (plus shadow mirror) in .cairn/.
+fn auto_init(cairn_dir: &Path) -> Result<()> {
+    let mut vault = CairnVault::open(cairn_dir).context("Failed to create vault")?;
 
-    // Create .cairn directory structure (flattened)
-    fs::create_dir(cairn_dir).context("Failed to create .cairn directory")?;
-    fs::create_dir(cairn_dir.join("blobs")).context("Failed to create blobs directory")?;
-    fs::create_dir(cairn_dir.join("trees")).context("Failed to create trees directory")?;
-    fs::create_dir(cairn_dir.join("patches")).context("Failed to create patches directory")?;
-
-    // Create initial empty state
+    // Persist the initial empty state so tracked paths are established.
     let initial_state = cairn::state::RepositoryState::new();
     initial_state
-        .save(cairn_dir)
+        .save(&mut vault)
         .context("Failed to save initial state")?;
 
     Ok(())

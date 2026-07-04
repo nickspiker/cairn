@@ -156,25 +156,29 @@ Configure build commands in settings.json:
 **Repository structure:**
 ```
 .cairn/
-├── state.vsf           # Current state + patch list
-├── blobs/              # Content-addressed file storage (BLAKE3)
-│   ├── 2XUfz4n9...
-│   └── ELp5CGJt...
-├── trees/              # Directory snapshots (path→blob mappings)
-│   └── Qrf5unc2...
-└── patches/            # VSF-encoded patches
-    ├── Qrf5unc2...     # First patch (references tree + full blobs)
-    └── 6MNSUfvY...     # Later patch (references tree + diffs)
+├── vault           # All repository objects in one mirrored store (manifestus engine)
+├── vault.shadow    # Second mirror ring — every block write-verified on both
+└── lock            # Exclusive repository lock (concurrent cairn invocations queue)
 ```
 
-**Storage architecture (inspired by Git):**
+**Storage architecture (vault-based, the same engine as Photon's storage stack):**
+
+All objects live in a single crash-proof key-value vault (manifestus): every 4KB block
+is BLAKE3-sealed, every write is verified by read-back and mirrored, and every
+operation commits a generation — power loss at any byte boundary leaves the previous
+committed state, never a torn file. The vault starts at 5MB per mirror and grows
+automatically. No hash-named loose files means no case-sensitivity or partial-write
+hazards on any filesystem.
+
+Object model (inspired by Git), addressed by BLAKE3-derived 32-byte keys:
 
 1. **Blobs** - Raw file content, stored once, referenced by BLAKE3 hash
    - Deduplicated: identical files share the same blob
    - Content-addressed: same content = same hash = stored once
+   - Any size: multi-gigabyte files are single extent-addressed objects in the vault
 
 2. **Trees** - Directory snapshots mapping file paths to blob hashes
-   - Captures complete project state at a point in time
+   - Paths normalized (project-relative, forward-slash) so trees round-trip across OSes
    - Enables fast diff comparison between patches
 
 3. **Patches** - Contain:
@@ -225,8 +229,14 @@ git add -A && git commit  # When ready, commit to git
 
 **Current stability issues:**
 - Random build hangs (investigating)
-- Jump may not cleanly restore state in edge cases
-- Snapshot saves may silently fail in edge cases
+
+**Open items (not pressing):**
+- `cairn rollback` is disabled pending redesign; use `cairn jump`
+- Pre-vault `.cairn/` layouts (loose `blobs/`, `trees/`, `patches/`) are not
+  migrated — the vault starts fresh alongside them; `cairn clear` removes both
+- The vault is opened per operation (lock + index walk); if that ever gets slow
+  on huge histories, the daemon should own a persistent handle and the CLI
+  should talk to it
 
 **Design limitations:**
 - **Linear history** - No merges yet

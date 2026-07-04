@@ -24,13 +24,14 @@
 //! ```
 
 use anyhow::{Context, Result, anyhow};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use vsf::{VsfBuilder, VsfSection, VsfType};
 
 use crate::hash_encoding::base58_encode;
 use crate::patch::ByteOp;
 use crate::state::Blake3Hash;
+use crate::tree::{hex_label_to_path, path_to_hex_label};
+use crate::vault::{CairnVault, patch_key};
 use std::collections::HashMap;
 
 /// Information needed to create a patch
@@ -91,19 +92,61 @@ pub struct Patch {
     pub file_diffs: Option<HashMap<PathBuf, FileDiff>>,
 }
 
-/// Convert a VsfSection to a VsfField (for nested field representation)
-///
-/// Takes a section and converts all its fields into a VsfField where each
-/// original field becomes a nested value.
-fn section_to_field(section: VsfSection) -> vsf::VsfField {
-    let mut values = Vec::new();
-
-    for field in section.fields {
-        // Each field in the section becomes a nested field value
-        values.push(VsfType::f(Box::new(field)));
+/// Serialize diff operations into one compact byte payload (stored as a `v(b'O', ...)`
+/// wrapped value — the VSF idiom for opaque structured bytes, in place of the removed
+/// nested-field encoding). Per op: tag byte (0=Copy, 1=Insert), then LE u64 operands.
+fn encode_ops(ops: &[ByteOp]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for op in ops {
+        match op {
+            ByteOp::Copy { start, len } => {
+                out.push(0);
+                out.extend_from_slice(&(*start as u64).to_le_bytes());
+                out.extend_from_slice(&(*len as u64).to_le_bytes());
+            }
+            ByteOp::Insert { content } => {
+                out.push(1);
+                out.extend_from_slice(&(content.len() as u64).to_le_bytes());
+                out.extend_from_slice(content);
+            }
+        }
     }
+    out
+}
 
-    vsf::VsfField::with_values(section.name, values)
+fn decode_ops(bytes: &[u8]) -> Result<Vec<ByteOp>> {
+    let mut ops = Vec::new();
+    let mut p = 0usize;
+    let take_u64 = |bytes: &[u8], p: &mut usize| -> Result<u64> {
+        let end = *p + 8;
+        let v = bytes
+            .get(*p..end)
+            .ok_or_else(|| anyhow!("Truncated diff ops payload"))?;
+        *p = end;
+        Ok(u64::from_le_bytes(v.try_into().unwrap()))
+    };
+    while p < bytes.len() {
+        let tag = bytes[p];
+        p += 1;
+        match tag {
+            0 => {
+                let start = take_u64(bytes, &mut p)? as usize;
+                let len = take_u64(bytes, &mut p)? as usize;
+                ops.push(ByteOp::Copy { start, len });
+            }
+            1 => {
+                let len = take_u64(bytes, &mut p)? as usize;
+                let content = bytes
+                    .get(p..p + len)
+                    .ok_or_else(|| anyhow!("Truncated diff insert payload"))?
+                    .to_vec();
+                p += len;
+                ops.push(ByteOp::Insert { content });
+            }
+            t => return Err(anyhow!("Unknown diff op tag: {t}")),
+        }
+    }
+    Ok(ops)
 }
 
 /// Create a patch from metadata
@@ -118,17 +161,15 @@ fn section_to_field(section: VsfSection) -> vsf::VsfField {
 ///
 /// # Returns
 /// * `Blake3Hash` - The patch's content-based provenance hash (hp)
-pub fn create_patch(info: PatchInfo) -> Result<Blake3Hash> {
+pub fn create_patch(vault: &mut CairnVault, info: PatchInfo) -> Result<Blake3Hash> {
     // 1. Patch ID = tree hash (pure content-based)
     // Identical source files → identical tree hash → identical patch ID
     // Parent is stored IN the patch VSF, but not part of the ID
     let content_hash = info.tree_hp;
 
     // 2. Check if patch with this content already exists
-    let patches_dir = PathBuf::from(".cairn/patches");
-    let patch_path = patches_dir.join(format!("{}.vsf", base58_encode(&content_hash)));
-
-    if patch_path.exists() {
+    let key = patch_key(&content_hash);
+    if vault.exists(&key)? {
         // Duplicate patch - return existing hash without writing
         println!("  Patch already exists (content-based deduplication)");
         return Ok(content_hash);
@@ -154,75 +195,44 @@ pub fn create_patch(info: PatchInfo) -> Result<Blake3Hash> {
         let mut parent_section = VsfSection::new("parent");
         parent_section.add_field("patch", VsfType::hp(parent_hp.to_vec()));
 
-        // Add diffs as a multi-value field with nested file diffs
+        // Diffs as parallel multi-value fields — index i across the five fields is one
+        // file's diff. Sorted by normalized path for deterministic encoding.
         if let Some(ref diffs) = info.file_diffs {
-            // Sort entries by path for deterministic hash computation
-            let mut sorted_diffs: Vec<_> = diffs.iter().collect();
-            sorted_diffs.sort_by_key(|(path, _)| path.as_os_str());
+            let mut sorted_diffs: Vec<(String, &FileDiff)> = diffs
+                .iter()
+                .map(|(path, diff)| Ok((path_to_hex_label(path)?, diff)))
+                .collect::<Result<_>>()?;
+            sorted_diffs.sort_by(|(a, _), (b, _)| a.cmp(b));
 
-            let mut file_diff_fields = Vec::new();
-
-            for (path, diff) in sorted_diffs {
-                // Convert path to hex-encoded label (f_{hex})
-                let path_label = path_to_hex_label(path)?;
-
-                // Build file diff as nested fields
-                let mut file_values = Vec::new();
-
-                // Add strategy, old_blob, new_blob as nested fields
-                file_values.push(VsfType::f(Box::new(
-                    vsf::VsfField::with_values("strategy", vec![VsfType::u3(diff.strategy as u8)])
-                )));
-                file_values.push(VsfType::f(Box::new(
-                    vsf::VsfField::with_values("old_blob", vec![VsfType::hb(diff.old_blob.to_vec())])
-                )));
-                file_values.push(VsfType::f(Box::new(
-                    vsf::VsfField::with_values("new_blob", vec![VsfType::hb(diff.new_blob.to_vec())])
-                )));
-
-                // Build ops as nested fields
-                let mut op_fields = Vec::new();
-                for op in &diff.ops {
-                    match op {
-                        ByteOp::Copy { start, len } => {
-                            let copy_field = vsf::VsfField::with_values(
-                                "copy",
-                                vec![VsfType::u(*start, false), VsfType::u(*len, false)]
-                            );
-                            op_fields.push(VsfType::f(Box::new(copy_field)));
-                        }
-                        ByteOp::Insert { content } => {
-                            let insert_field = vsf::VsfField::with_values(
-                                "insert",
-                                vec![VsfType::v('b' as u8, content.clone())]
-                            );
-                            op_fields.push(VsfType::f(Box::new(insert_field)));
-                        }
-                    }
+            if !sorted_diffs.is_empty() {
+                let mut paths = Vec::new();
+                let mut strategies = Vec::new();
+                let mut olds = Vec::new();
+                let mut news = Vec::new();
+                let mut ops = Vec::new();
+                for (label, diff) in sorted_diffs {
+                    paths.push(VsfType::x(label));
+                    strategies.push(VsfType::u3(diff.strategy as u8));
+                    olds.push(VsfType::hb(diff.old_blob.to_vec()));
+                    news.push(VsfType::hb(diff.new_blob.to_vec()));
+                    ops.push(VsfType::v(b'O', encode_ops(&diff.ops)));
                 }
-
-                // Add ops field containing operation nested fields
-                file_values.push(VsfType::f(Box::new(
-                    vsf::VsfField::with_values("ops", op_fields)
-                )));
-
-                // Create the file diff field with all values
-                let file_diff_field = vsf::VsfField::with_values(&path_label, file_values);
-                file_diff_fields.push(VsfType::f(Box::new(file_diff_field)));
+                parent_section.add_field_multi("diff_path", paths);
+                parent_section.add_field_multi("diff_strategy", strategies);
+                parent_section.add_field_multi("diff_old", olds);
+                parent_section.add_field_multi("diff_new", news);
+                parent_section.add_field_multi("diff_ops", ops);
             }
-
-            // Add diffs field with all file diff nested fields
-            parent_section.add_field_multi("diffs", file_diff_fields);
         }
 
         builder = builder.add_section_direct(parent_section);
     }
 
-    // 4. Build and write VSF
+    // 4. Build and store VSF
     let patch_bytes = builder.build().map_err(|e| anyhow!("{}", e))?;
-    fs::create_dir_all(&patches_dir).context("Failed to create patches directory")?;
-    fs::write(&patch_path, &patch_bytes)
-        .with_context(|| format!("Failed to write patch {}", base58_encode(&content_hash)))?;
+    vault
+        .put(&key, &patch_bytes)
+        .with_context(|| format!("Failed to store patch {}", base58_encode(&content_hash)))?;
 
     println!("  Wrote patch: {}", base58_encode(&content_hash));
     Ok(content_hash)
@@ -236,12 +246,10 @@ pub fn create_patch(info: PatchInfo) -> Result<Blake3Hash> {
 ///
 /// # Returns
 /// * `Patch` - Parsed patch data
-pub fn load_patch(cairn_dir: &Path, hp: &Blake3Hash) -> Result<Patch> {
-    let patch_path = cairn_dir.join("patches")
-        .join(format!("{}.vsf", base58_encode(hp)));
-
-    let bytes = fs::read(&patch_path)
-        .with_context(|| format!("Failed to load patch {}", base58_encode(hp)))?;
+pub fn load_patch(vault: &mut CairnVault, hp: &Blake3Hash) -> Result<Patch> {
+    let bytes = vault
+        .get(&patch_key(hp))?
+        .ok_or_else(|| anyhow!("Patch not found: {}", base58_encode(hp)))?;
 
     // Parse VSF header
     let (header, _) = vsf::VsfHeader::decode(&bytes)
@@ -262,12 +270,12 @@ pub fn load_patch(cairn_dir: &Path, hp: &Blake3Hash) -> Result<Patch> {
         let section = VsfSection::parse(&bytes, &mut ptr)
             .map_err(|e| anyhow!("Failed to parse section '{}': {}", field.name, e))?;
 
-        match section.name.as_str() {
+        match field.name.as_str() {
             "patch_metadata" => {
                 // Extract message
                 if let Some(msg_field) = section.get_field("message") {
-                    if let Some(VsfType::x(text)) = msg_field.values.first() {
-                        message = text.clone();
+                    if let Some(text) = msg_field.values.first().and_then(|v| v.as_string()) {
+                        message = text.to_string();
                     }
                 }
             }
@@ -293,133 +301,49 @@ pub fn load_patch(cairn_dir: &Path, hp: &Blake3Hash) -> Result<Patch> {
                     }
                 }
 
-                // Extract diffs field (now contains nested fields, not subsections)
-                if let Some(diffs_field) = section.get_field("diffs") {
-                    if let Some(VsfType::f(diffs_nested)) = diffs_field.values.first() {
-                        let mut diffs_map = std::collections::HashMap::new();
+                // Diffs are parallel multi-value fields: index i across the five fields
+                // is one file's diff.
+                if let Some(paths_field) = section.get_field("diff_path") {
+                    let strategies = section.get_field("diff_strategy");
+                    let olds = section.get_field("diff_old");
+                    let news = section.get_field("diff_new");
+                    let ops_field = section.get_field("diff_ops");
 
-                        // Iterate thru file diff nested fields
-                        for file_value in &diffs_nested.values {
-                            if let VsfType::f(file_nested) = file_value {
-                                // Decode hex path name (format: "f_7372632f6d61696e2e7273")
-                                let hex_label = &file_nested.name;
-                                if !hex_label.starts_with("f_") {
-                                    continue; // Skip non-file fields
-                                }
+                    let mut diffs_map = std::collections::HashMap::new();
+                    for (i, path_value) in paths_field.values.iter().enumerate() {
+                        let Some(label) = path_value.as_string() else {
+                            return Err(anyhow!("diff_path[{i}] is not a text value"));
+                        };
+                        let path = hex_label_to_path(label)?;
 
-                                let path = match hex_label_to_path(hex_label) {
-                                    Ok(p) => p,
-                                    Err(_) => continue, // Skip invalid paths
-                                };
+                        let strategy = match strategies.and_then(|f| f.values.get(i)) {
+                            Some(VsfType::u3(v)) => DiffStrategy::from_u8(*v)?,
+                            _ => return Err(anyhow!("Missing diff_strategy[{i}]")),
+                        };
 
-                                // Helper to find a nested field value by name
-                                let find_field = |name: &str| -> Option<&VsfType> {
-                                    file_nested.values.iter()
-                                        .find_map(|v| {
-                                            if let VsfType::f(field) = v {
-                                                if field.name == name {
-                                                    field.values.first()
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                };
-
-                                // Extract strategy
-                                let strategy = if let Some(VsfType::u3(val)) = find_field("strategy") {
-                                    match val {
-                                        0 => DiffStrategy::Diff,
-                                        1 => DiffStrategy::NewBlob,
-                                        _ => DiffStrategy::Diff,
-                                    }
-                                } else {
-                                    DiffStrategy::Diff
-                                };
-
-                                // Extract old_blob hash
-                                let mut old_blob = [0u8; 32];
-                                if let Some(VsfType::hb(hash_vec)) = find_field("old_blob") {
-                                    if hash_vec.len() == 32 {
-                                        old_blob.copy_from_slice(hash_vec.as_slice());
-                                    }
-                                }
-
-                                // Extract new_blob hash
-                                let mut new_blob = [0u8; 32];
-                                if let Some(VsfType::hb(hash_vec)) = find_field("new_blob") {
-                                    if hash_vec.len() == 32 {
-                                        new_blob.copy_from_slice(hash_vec.as_slice());
-                                    }
-                                }
-
-                                // Extract ops field (contains nested field values for operations)
-                                let mut ops = Vec::new();
-                                if let Some(ops_nested) = file_nested.values.iter().find_map(|v| {
-                                    if let VsfType::f(field) = v {
-                                        if field.name == "ops" {
-                                            Some(field.as_ref())
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                }) {
-                                    // Each value in ops_nested.values is a nested field for an operation
-                                    for op_value in &ops_nested.values {
-                                        if let VsfType::f(op_field) = op_value {
-                                            match op_field.name.as_str() {
-                                                "copy" => {
-                                                    // Copy operation has two values: start and len
-                                                    let start = op_field.values.get(0)
-                                                        .and_then(|v| match v {
-                                                            VsfType::u(val, _) => Some(*val),
-                                                            _ => None,
-                                                        })
-                                                        .unwrap_or(0);
-
-                                                    let len = op_field.values.get(1)
-                                                        .and_then(|v| match v {
-                                                            VsfType::u(val, _) => Some(*val),
-                                                            _ => None,
-                                                        })
-                                                        .unwrap_or(0);
-
-                                                    ops.push(crate::patch::ByteOp::Copy { start, len });
-                                                }
-                                                "insert" => {
-                                                    // Insert operation has one value: wrapped data
-                                                    let content = op_field.values.first()
-                                                        .and_then(|v| match v {
-                                                            VsfType::v(_, data) => Some(data.clone()),
-                                                            _ => None,
-                                                        })
-                                                        .unwrap_or_else(Vec::new);
-
-                                                    ops.push(crate::patch::ByteOp::Insert { content });
-                                                }
-                                                _ => {} // Unknown op type
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Create FileDiff and add to map
-                                let file_diff = FileDiff {
-                                    strategy,
-                                    old_blob,
-                                    new_blob,
-                                    ops,
-                                };
-                                diffs_map.insert(path, file_diff);
+                        let mut old_blob = [0u8; 32];
+                        if let Some(VsfType::hb(h)) = olds.and_then(|f| f.values.get(i)) {
+                            if h.len() == 32 {
+                                old_blob.copy_from_slice(h);
                             }
                         }
 
-                        file_diffs = Some(diffs_map);
+                        let mut new_blob = [0u8; 32];
+                        if let Some(VsfType::hb(h)) = news.and_then(|f| f.values.get(i)) {
+                            if h.len() == 32 {
+                                new_blob.copy_from_slice(h);
+                            }
+                        }
+
+                        let ops = match ops_field.and_then(|f| f.values.get(i)) {
+                            Some(VsfType::v(b'O', bytes)) => decode_ops(bytes)?,
+                            _ => return Err(anyhow!("Missing diff_ops[{i}]")),
+                        };
+
+                        diffs_map.insert(path, FileDiff { strategy, old_blob, new_blob, ops });
                     }
+
+                    file_diffs = Some(diffs_map);
                 }
             }
             _ => {
@@ -436,54 +360,9 @@ pub fn load_patch(cairn_dir: &Path, hp: &Blake3Hash) -> Result<Patch> {
     })
 }
 
-/// Convert a file path to a hex-encoded VSF label with f_ prefix
-///
-/// # Arguments
-/// * `path` - File path to encode
-///
-/// # Returns
-/// * `String` - Hex-encoded label (e.g., "f_7372632f6c69622e7273" for "src/lib.rs")
-fn path_to_hex_label(path: &PathBuf) -> Result<String> {
-    let path_str = path.to_str()
-        .ok_or_else(|| anyhow!("Path contains invalid UTF-8"))?;
-    let hex = hex::encode(path_str.as_bytes());
-    Ok(format!("f_{}", hex))
-}
-
-/// Convert a hex-encoded VSF label back to a file path
-///
-/// # Arguments
-/// * `label` - Hex-encoded label (e.g., "f_7372632f6c69622e7273")
-///
-/// # Returns
-/// * `PathBuf` - Decoded file path
-fn hex_label_to_path(label: &str) -> Result<PathBuf> {
-    // Remove f_ prefix
-    let hex_str = label.strip_prefix("f_")
-        .ok_or_else(|| anyhow!("Label does not start with f_ prefix: {}", label))?;
-
-    // Decode hex to bytes
-    let bytes = hex::decode(hex_str)
-        .with_context(|| format!("Failed to decode hex label: {}", label))?;
-
-    // Convert bytes to UTF-8 string
-    let path_str = String::from_utf8(bytes)
-        .with_context(|| format!("Invalid UTF-8 in decoded path from label: {}", label))?;
-
-    Ok(PathBuf::from(path_str))
-}
-
-/// Check if a commit exists
-///
-/// # Arguments
-/// * `hp` - Provenance hash (BLAKE3) of the commit to check
-///
-/// # Returns
-/// * `bool` - true if the commit exists, false otherwise
-pub fn commit_exists(hp: &Blake3Hash) -> bool {
-    let commit_path = PathBuf::from(".cairn/patches")
-        .join(format!("{}.vsf", base58_encode(hp)));
-    commit_path.exists()
+/// Check if a patch exists
+pub fn commit_exists(vault: &mut CairnVault, hp: &Blake3Hash) -> bool {
+    vault.exists(&patch_key(hp)).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -492,210 +371,139 @@ mod tests {
     use crate::blob::store_blob;
     use crate::tree::create_tree;
     use std::collections::HashMap;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    // Use a mutex to ensure tests run sequentially (they modify global state via cwd)
-    static TEST_MUTEX: Mutex<()> = Mutex::new(());
+    fn vault(dir: &TempDir) -> CairnVault {
+        CairnVault::open(&dir.path().join(".cairn")).unwrap()
+    }
 
     #[test]
     fn test_create_and_load_patch_no_parent() -> Result<()> {
-        let _lock = TEST_MUTEX.lock().unwrap();
-        let temp_dir = TempDir::new()?;
-        let original_dir = std::env::current_dir()?;
-        std::env::set_current_dir(temp_dir.path())?;
+        let dir = TempDir::new()?;
+        let mut v = vault(&dir);
 
-        let result = (|| -> Result<()> {
-            // Create a blob and tree first
-            let blob_hash = store_blob(b"test content")?;
-            let mut file_to_blob = HashMap::new();
-            file_to_blob.insert(PathBuf::from("test.txt"), blob_hash);
-            let tree_hp = create_tree(&file_to_blob)?;
+        let blob_hash = store_blob(&mut v, b"test content")?;
+        let mut file_to_blob = HashMap::new();
+        file_to_blob.insert(PathBuf::from("test.txt"), blob_hash);
+        let tree_hp = create_tree(&mut v, &file_to_blob)?;
 
-            // Create commit (no parent)
-            let commit_info = PatchInfo {
-                message: "Initial commit".to_string(),
-                tree_hp,
-                parent_patch_hp: None,
-                file_diffs: None,
-            };
+        let commit_info = PatchInfo {
+            message: "Initial commit".to_string(),
+            tree_hp,
+            parent_patch_hp: None,
+            file_diffs: None,
+        };
+        let commit_hp = create_patch(&mut v, commit_info)?;
+        assert!(commit_exists(&mut v, &commit_hp));
 
-            let commit_hp = create_patch(commit_info)?;
-
-            // Verify commit exists
-            assert!(commit_exists(&commit_hp));
-
-            // Load commit
-            let cairn_dir = PathBuf::from(".cairn");
-            let loaded = load_patch(&cairn_dir, &commit_hp)?;
-
-            // Verify fields
-            assert_eq!(loaded.message, "Initial commit");
-            assert_eq!(loaded.tree_hp, tree_hp);
-            assert_eq!(loaded.parent_patch_hp, None);
-
-            Ok(())
-        })();
-
-        std::env::set_current_dir(original_dir)?;
-        result
+        let loaded = load_patch(&mut v, &commit_hp)?;
+        assert_eq!(loaded.message, "Initial commit");
+        assert_eq!(loaded.tree_hp, tree_hp);
+        assert_eq!(loaded.parent_patch_hp, None);
+        Ok(())
     }
 
     #[test]
     fn test_create_and_load_patch_with_parent() -> Result<()> {
-        let _lock = TEST_MUTEX.lock().unwrap();
-        let temp_dir = TempDir::new()?;
-        let original_dir = std::env::current_dir()?;
-        std::env::set_current_dir(temp_dir.path())?;
+        let dir = TempDir::new()?;
+        let mut v = vault(&dir);
 
-        let result = (|| -> Result<()> {
-            // Create first commit
-            let blob1 = store_blob(b"content 1")?;
-            let mut tree1_files = HashMap::new();
-            tree1_files.insert(PathBuf::from("file1.txt"), blob1);
-            let tree1_hp = create_tree(&tree1_files)?;
+        let blob1 = store_blob(&mut v, b"content 1")?;
+        let mut tree1_files = HashMap::new();
+        tree1_files.insert(PathBuf::from("file1.txt"), blob1);
+        let tree1_hp = create_tree(&mut v, &tree1_files)?;
 
-            let commit1_info = PatchInfo {
-                message: "First commit".to_string(),
-                tree_hp: tree1_hp,
-                parent_patch_hp: None,
-                file_diffs: None,
-            };
-            let commit1_hp = create_patch(commit1_info)?;
+        let commit1_hp = create_patch(&mut v, PatchInfo {
+            message: "First commit".to_string(),
+            tree_hp: tree1_hp,
+            parent_patch_hp: None,
+            file_diffs: None,
+        })?;
 
-            // Create second commit with parent
-            let blob2 = store_blob(b"content 2")?;
-            let mut tree2_files = HashMap::new();
-            tree2_files.insert(PathBuf::from("file2.txt"), blob2);
-            let tree2_hp = create_tree(&tree2_files)?;
+        let blob2 = store_blob(&mut v, b"content 2")?;
+        let mut tree2_files = HashMap::new();
+        tree2_files.insert(PathBuf::from("file2.txt"), blob2);
+        let tree2_hp = create_tree(&mut v, &tree2_files)?;
 
-            let commit2_info = PatchInfo {
-                message: "Second commit".to_string(),
-                tree_hp: tree2_hp,
-                parent_patch_hp: Some(commit1_hp),
-                file_diffs: None,
-            };
-            let commit2_hp = create_patch(commit2_info)?;
+        let commit2_hp = create_patch(&mut v, PatchInfo {
+            message: "Second commit".to_string(),
+            tree_hp: tree2_hp,
+            parent_patch_hp: Some(commit1_hp),
+            file_diffs: None,
+        })?;
 
-            // Load second commit
-            let cairn_dir = PathBuf::from(".cairn");
-            let loaded = load_patch(&cairn_dir, &commit2_hp)?;
-
-            // Verify parent reference
-            assert_eq!(loaded.message, "Second commit");
-            assert_eq!(loaded.tree_hp, tree2_hp);
-            assert_eq!(loaded.parent_patch_hp, Some(commit1_hp));
-
-            Ok(())
-        })();
-
-        std::env::set_current_dir(original_dir)?;
-        result
+        let loaded = load_patch(&mut v, &commit2_hp)?;
+        assert_eq!(loaded.message, "Second commit");
+        assert_eq!(loaded.tree_hp, tree2_hp);
+        assert_eq!(loaded.parent_patch_hp, Some(commit1_hp));
+        Ok(())
     }
 
     #[test]
     fn test_commit_content_based_hashing() -> Result<()> {
-        let _lock = TEST_MUTEX.lock().unwrap();
-        let temp_dir = TempDir::new()?;
-        let original_dir = std::env::current_dir()?;
-        std::env::set_current_dir(temp_dir.path())?;
+        let dir = TempDir::new()?;
+        let mut v = vault(&dir);
 
-        let result = (|| -> Result<()> {
-            // Create same tree
-            let blob_hash = store_blob(b"test")?;
-            let mut file_to_blob = HashMap::new();
-            file_to_blob.insert(PathBuf::from("test.txt"), blob_hash);
-            let tree_hp = create_tree(&file_to_blob)?;
+        let blob_hash = store_blob(&mut v, b"test")?;
+        let mut file_to_blob = HashMap::new();
+        file_to_blob.insert(PathBuf::from("test.txt"), blob_hash);
+        let tree_hp = create_tree(&mut v, &file_to_blob)?;
 
-            // Create first commit
-            let commit1_info = PatchInfo {
-                message: "Test commit".to_string(),
-                tree_hp,
-                parent_patch_hp: None,
-                file_diffs: None,
-            };
-            let commit1_hp = create_patch(commit1_info)?;
+        let commit1_hp = create_patch(&mut v, PatchInfo {
+            message: "Test commit".to_string(),
+            tree_hp,
+            parent_patch_hp: None,
+            file_diffs: None,
+        })?;
 
-            // Create second commit with identical tree but DIFFERENT message
-            let commit2_info = PatchInfo {
-                message: "Different message".to_string(),
-                tree_hp,
-                parent_patch_hp: None,
-                file_diffs: None,
-            };
-            let commit2_hp = create_patch(commit2_info)?;
+        // Identical tree, different message → same patch ID (message is metadata only).
+        let commit2_hp = create_patch(&mut v, PatchInfo {
+            message: "Different message".to_string(),
+            tree_hp,
+            parent_patch_hp: None,
+            file_diffs: None,
+        })?;
+        assert_eq!(commit1_hp, commit2_hp);
 
-            // Patches should have identical hp since tree content is identical
-            // (message is metadata only, not part of patch identity)
-            assert_eq!(
-                commit1_hp, commit2_hp,
-                "Patches with identical tree should have identical hp regardless of message"
-            );
-
-            // Load and verify the first patch still has its original metadata
-            let cairn_dir = PathBuf::from(".cairn");
-            let loaded = load_patch(&cairn_dir, &commit1_hp)?;
-            assert_eq!(loaded.tree_hp, tree_hp);
-            assert_eq!(loaded.message, "Test commit");
-
-            Ok(())
-        })();
-
-        std::env::set_current_dir(original_dir)?;
-        result
+        let loaded = load_patch(&mut v, &commit1_hp)?;
+        assert_eq!(loaded.tree_hp, tree_hp);
+        assert_eq!(loaded.message, "Test commit");
+        Ok(())
     }
 
     #[test]
     fn test_commit_chain() -> Result<()> {
-        let _lock = TEST_MUTEX.lock().unwrap();
-        let temp_dir = TempDir::new()?;
-        let original_dir = std::env::current_dir()?;
-        std::env::set_current_dir(temp_dir.path())?;
+        let dir = TempDir::new()?;
+        let mut v = vault(&dir);
 
-        let result = (|| -> Result<()> {
-            // Create chain of 3 commits
-            let mut commits = Vec::new();
-            let mut parent_hp = None;
+        let mut commits = Vec::new();
+        let mut parent_hp = None;
+        for i in 0..3 {
+            let blob = store_blob(&mut v, format!("content {}", i).as_bytes())?;
+            let mut tree_files = HashMap::new();
+            tree_files.insert(PathBuf::from(format!("file{}.txt", i)), blob);
+            let tree_hp = create_tree(&mut v, &tree_files)?;
 
-            for i in 0..3 {
-                let blob = store_blob(format!("content {}", i).as_bytes())?;
-                let mut tree_files = HashMap::new();
-                tree_files.insert(PathBuf::from(format!("file{}.txt", i)), blob);
-                let tree_hp = create_tree(&tree_files)?;
+            let commit_hp = create_patch(&mut v, PatchInfo {
+                message: format!("Patch {}", i),
+                tree_hp,
+                parent_patch_hp: parent_hp,
+                file_diffs: None,
+            })?;
+            commits.push(commit_hp);
+            parent_hp = Some(commit_hp);
+        }
 
-                let commit_info = PatchInfo {
-                    message: format!("Patch {}", i),
-                    tree_hp,
-                    parent_patch_hp: parent_hp,
-                    file_diffs: None,
-                };
-
-                let commit_hp = create_patch(commit_info)?;
-                commits.push(commit_hp);
-                parent_hp = Some(commit_hp);
-            }
-
-            // Verify chain: commit 2 → commit 1 → commit 0
-            let cairn_dir = PathBuf::from(".cairn");
-            let commit2 = load_patch(&cairn_dir, &commits[2])?;
-            assert_eq!(commit2.parent_patch_hp, Some(commits[1]));
-
-            let commit1 = load_patch(&cairn_dir, &commits[1])?;
-            assert_eq!(commit1.parent_patch_hp, Some(commits[0]));
-
-            let commit0 = load_patch(&cairn_dir, &commits[0])?;
-            assert_eq!(commit0.parent_patch_hp, None);
-
-            Ok(())
-        })();
-
-        std::env::set_current_dir(original_dir)?;
-        result
+        assert_eq!(load_patch(&mut v, &commits[2])?.parent_patch_hp, Some(commits[1]));
+        assert_eq!(load_patch(&mut v, &commits[1])?.parent_patch_hp, Some(commits[0]));
+        assert_eq!(load_patch(&mut v, &commits[0])?.parent_patch_hp, None);
+        Ok(())
     }
 
     #[test]
     fn test_commit_nonexistent() {
-        let fake_hp = [0u8; 32];
-        assert!(!commit_exists(&fake_hp));
+        let dir = TempDir::new().unwrap();
+        let mut v = vault(&dir);
+        assert!(!commit_exists(&mut v, &[0u8; 32]));
     }
 }
